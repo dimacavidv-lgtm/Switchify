@@ -908,8 +908,8 @@ static class Pdf
 
     static PdfDocument Open(string path)
     {
-        var file = WinRt.Wait(StorageFile.GetFileFromPathAsync(path));
-        return WinRt.Wait(PdfDocument.LoadFromFileAsync(file));
+        // Se carga desde memoria: abrirlo con StorageFile dejaría el archivo bloqueado mientras dure la conversión.
+        return WinRt.Wait(PdfDocument.LoadFromStreamAsync(WinRt.ToStream(File.ReadAllBytes(path))));
     }
 
     static InMemoryRandomAccessStream Render(PdfDocument doc, uint index, double scale)
@@ -989,6 +989,20 @@ static class WinRt
         if (op.Status == AsyncStatus.Canceled) throw new OperationCanceledException();
     }
 
+    public static InMemoryRandomAccessStream ToStream(byte[] bytes)
+    {
+        var stream = new InMemoryRandomAccessStream();
+        using (var writer = new DataWriter(stream.GetOutputStreamAt(0)))
+        {
+            writer.WriteBytes(bytes);
+            Wait(writer.StoreAsync());
+            Wait(writer.FlushAsync());
+            writer.DetachStream();
+        }
+        stream.Seek(0);
+        return stream;
+    }
+
     public static byte[] ReadAll(IRandomAccessStream stream)
     {
         using (var reader = new DataReader(stream.GetInputStreamAt(0)))
@@ -1012,8 +1026,7 @@ static class Ocr
 
     public static string FromImageFile(string path)
     {
-        var file = WinRt.Wait(StorageFile.GetFileFromPathAsync(path));
-        using (var stream = WinRt.Wait(file.OpenAsync(FileAccessMode.Read)))
+        using (var stream = WinRt.ToStream(File.ReadAllBytes(path)))
             return Recognize(Engine(), stream);
     }
 
@@ -1043,6 +1056,8 @@ static class Ocr
 
 static class Edge
 {
+    static readonly object Gate = new object();
+
     static string FindExe()
     {
         var candidates = new[]
@@ -1067,12 +1082,16 @@ static class Edge
                                     "--user-data-dir=\"{0}\" --print-to-pdf=\"{1}\" \"{2}\"",
                                     profile, pdfPath, new Uri(htmlPath).AbsoluteUri);
         var psi = new ProcessStartInfo(exe, args) { UseShellExecute = false, CreateNoWindow = true };
-        using (var p = Process.Start(psi))
+        // De uno en uno: dos Edge con el mismo perfil a la vez hacen que el segundo termine sin generar nada.
+        lock (Gate)
         {
-            if (!p.WaitForExit(120000))
+            using (var p = Process.Start(psi))
             {
-                try { p.Kill(); } catch { }
-                throw new TimeoutException("Edge tardó demasiado en generar el PDF.");
+                if (!p.WaitForExit(120000))
+                {
+                    try { p.Kill(); } catch { }
+                    throw new TimeoutException("Edge tardó demasiado en generar el PDF.");
+                }
             }
         }
         if (!File.Exists(pdfPath)) throw new IOException("Edge no generó el PDF.");

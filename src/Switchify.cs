@@ -279,6 +279,12 @@ static class ExplorerSelection
             }
         }
         catch { }
+        finally
+        {
+            // Suelta las referencias COM al Explorador en lugar de esperar al recolector.
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+        }
         return result;
     }
 }
@@ -501,6 +507,9 @@ class RadialMenu : Form
                     errors.Add(Path.GetFileName(input ?? "") + ": " + ex.Message);
                 }
             }
+            // Libera ya los objetos de Windows (PDF, OCR) que pudieran seguir referenciando archivos.
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
             BeginInvoke(new Action(() =>
             {
                 if (ActionFinished == null) return;
