@@ -20,10 +20,65 @@ using System.Windows.Forms;
 
 class EditorTheme
 {
-    public bool Dark;
+    public bool Dark, Glass, LightText;
     public float Scale;
     public Color Window, Canvas, Text, Secondary, Separator, Accent, AccentPressed, Control, ControlPressed, ControlSelected, Track;
     public FontFamily Semibold, Regular;
+
+    // Cristal igual que el menú: lo que hay detrás se ve entero pero difuminado, con un tinte del 15 %.
+    // El texto y los controles se vuelven claros u oscuros según ese fondo.
+    public const float Frost = 1f;
+    bool glassReady;
+
+    public void UseGlass(double backdropLuminance)
+    {
+        // Con margen: si el fondo ronda el punto medio, no se cambia de claro a oscuro (evita parpadeos al mover).
+        LightText = !glassReady ? backdropLuminance < 0.5 : LightText ? backdropLuminance < 0.55 : backdropLuminance < 0.45;
+        glassReady = true;
+        Glass = true;
+        Window = Dark ? Color.FromArgb(42, 28, 28, 30) : Color.FromArgb(38, 246, 246, 248);
+        if (LightText)
+        {
+            Canvas = Color.FromArgb(40, 0, 0, 0);
+            Text = Color.FromArgb(245, 255, 255, 255);
+            Secondary = Color.FromArgb(200, 255, 255, 255);
+            Separator = Color.FromArgb(60, 255, 255, 255);
+            Control = Color.FromArgb(64, 255, 255, 255);
+            ControlPressed = Color.FromArgb(96, 255, 255, 255);
+            ControlSelected = Color.FromArgb(120, 255, 255, 255);
+            Track = Color.FromArgb(80, 255, 255, 255);
+        }
+        else
+        {
+            Canvas = Color.FromArgb(40, 255, 255, 255);
+            Text = Color.FromArgb(235, 0, 0, 0);
+            Secondary = Color.FromArgb(190, 20, 20, 25);
+            Separator = Color.FromArgb(45, 0, 0, 0);
+            Control = Color.FromArgb(64, 255, 255, 255);
+            ControlPressed = Color.FromArgb(40, 0, 0, 0);
+            ControlSelected = Color.FromArgb(235, 255, 255, 255);
+            Track = Color.FromArgb(50, 0, 0, 0);
+        }
+    }
+
+    // Texto con halo del color contrario (como las etiquetas del menú): se lee aunque detrás
+    // haya cualquier cosa. Sin cristal, texto normal.
+    public void DrawText(Graphics g, string text, Font font, RectangleF r, StringFormat sf, Color color, bool halo)
+    {
+        if (!Glass || !halo)
+        {
+            using (var b = new SolidBrush(color)) g.DrawString(text, font, b, r, sf);
+            return;
+        }
+        using (var path = new GraphicsPath())
+        {
+            path.AddString(text, font.FontFamily, (int)font.Style, font.Size, r, sf);
+            var h = LightText ? Color.FromArgb(150, 0, 0, 0) : Color.FromArgb(190, 255, 255, 255);
+            using (var glow = new Pen(Color.FromArgb(h.A / 3, h), 6f * Scale) { LineJoin = LineJoin.Round }) g.DrawPath(glow, path);
+            using (var line = new Pen(h, 2.6f * Scale) { LineJoin = LineJoin.Round }) g.DrawPath(line, path);
+            using (var b = new SolidBrush(color)) g.FillPath(b, path);
+        }
+    }
 
     public static EditorTheme Current(float scale)
     {
@@ -31,6 +86,7 @@ class EditorTheme
         var t = new EditorTheme
         {
             Dark = look.Dark,
+            Glass = !look.Solid,
             Scale = scale,
             Accent = look.Accent,
             AccentPressed = look.AccentPressed,
@@ -132,9 +188,8 @@ class TextWidget : Widget
     public override void Draw(Graphics g, EditorTheme t)
     {
         using (var f = t.Font(Size, !Secondary))
-        using (var b = new SolidBrush(Secondary ? t.Secondary : t.Text))
         using (var sf = new StringFormat { Alignment = Align, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
-            g.DrawString(Text, f, b, Bounds, sf);
+            t.DrawText(g, Text, f, Bounds, sf, Secondary ? t.Secondary : t.Text, true);
     }
 }
 
@@ -152,9 +207,8 @@ class PillButton : Widget
         using (var b = new SolidBrush(fill))
             g.FillPath(b, path);
         using (var f = t.Font(13f, true))
-        using (var b = new SolidBrush(Primary ? Color.White : t.Text))
         using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-            g.DrawString(Text, f, b, Bounds, sf);
+            t.DrawText(g, Text, f, Bounds, sf, Primary ? Color.White : t.Text, !Primary);
     }
 
     // Respuesta al pulsar; la acción ocurre al soltar dentro del botón (se cancela arrastrando fuera).
@@ -189,12 +243,14 @@ class Segmented : Widget
             g.FillPath(b, path);
 
         using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-        using (var b = new SolidBrush(t.Text))
         {
             for (int i = 0; i < Options.Length; i++)
             {
+                // El segmento elegido es casi opaco: ahí el texto no necesita halo.
+                bool selectedSolid = i == Index && t.ControlSelected.A > 200;
+                var color = selectedSolid ? Color.FromArgb(230, 0, 0, 0) : t.Text;
                 using (var f = t.Font(12.5f, i == Index))
-                    g.DrawString(Options[i], f, b, new RectangleF(Bounds.X + i * w, Bounds.Y, w, Bounds.Height), sf);
+                    t.DrawText(g, Options[i], f, new RectangleF(Bounds.X + i * w, Bounds.Y, w, Bounds.Height), sf, color, !selectedSolid);
             }
         }
     }
@@ -233,9 +289,8 @@ class Slider : Widget
         scale = t.Scale;
         var track = Track;
         using (var f = t.Font(13f, false))
-        using (var b = new SolidBrush(t.Text))
         using (var sf = new StringFormat { LineAlignment = StringAlignment.Center })
-            g.DrawString(Label, f, b, new RectangleF(Bounds.X, Bounds.Y, 92 * scale, Bounds.Height), sf);
+            t.DrawText(g, Label, f, new RectangleF(Bounds.X, Bounds.Y, 92 * scale, Bounds.Height), sf, t.Text, true);
 
         using (var path = Shapes.Rounded(track, track.Height / 2))
         using (var b = new SolidBrush(t.Track))
@@ -259,9 +314,8 @@ class Slider : Widget
         using (var p = new Pen(Color.FromArgb(30, 0, 0, 0), 1)) g.DrawEllipse(p, thumb);
 
         using (var f = t.Font(12.5f, false))
-        using (var b = new SolidBrush(t.Secondary))
         using (var sf = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center })
-            g.DrawString(Format(Value), f, b, new RectangleF(Bounds.Right - 70 * scale, Bounds.Y, 70 * scale, Bounds.Height), sf);
+            t.DrawText(g, Format(Value), f, new RectangleF(Bounds.Right - 70 * scale, Bounds.Y, 70 * scale, Bounds.Height), sf, t.Secondary, true);
     }
 
     float XFor(double v)
@@ -343,6 +397,24 @@ abstract class EditorForm : Form
     public static Action<string, string, bool> Notify;   // la bandeja muestra el aviso al guardar
 
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+    [DllImport("gdi32.dll")] static extern bool BitBlt(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, int rop);
+    [DllImport("user32.dll")] static extern bool SetWindowDisplayAffinity(IntPtr hwnd, int affinity);
+    [DllImport("dwmapi.dll")] static extern int DwmFlush();
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr hdc, IntPtr obj);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr hdc);
+
+    // Barra de título propia, al estilo macOS: cerrar, minimizar y maximizar a la izquierda.
+    static readonly Color[] LightColors = { Color.FromArgb(255, 95, 87), Color.FromArgb(254, 188, 46), Color.FromArgb(40, 200, 64) };
+    readonly float titleHeight;
+    int hoverLight = -1, pressedLight = -1;
+    Bitmap buffer;
+    Bitmap backdrop;            // lo que hay detrás de la ventana, desenfocado (para el esmerilado)
+    bool renderQueued;
+    readonly System.Windows.Forms.Timer moveTimer;
+    readonly System.Diagnostics.Stopwatch moveClock = System.Diagnostics.Stopwatch.StartNew();
+    readonly Size intendedSize;
 
     protected readonly string SourcePath;
     protected Bitmap Original;      // resolución completa
@@ -363,26 +435,168 @@ abstract class EditorForm : Form
         Original = ImageOps.Load(path);
         PreviewBase = Downscale(Original, 1600);
         panelHeight = panelHeightDip * S;
+        titleHeight = 40 * S;
 
         Text = title + " — " + Path.GetFileName(path);
         Icon = Theme.MakeTrayIcon();
-        StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size((int)(780 * S), (int)(560 * S + panelHeight));
-        MinimumSize = new Size((int)(560 * S), (int)(360 * S + panelHeight));
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition = FormStartPosition.Manual;
+        intendedSize = new Size((int)(780 * S), (int)(560 * S + panelHeight + titleHeight));
+        ClientSize = intendedSize;
+        MinimumSize = new Size((int)(560 * S), (int)(360 * S + panelHeight + titleHeight));
+        var area = Screen.FromPoint(Cursor.Position).WorkingArea;
+        Location = new Point(area.X + (area.Width - Width) / 2, area.Y + (area.Height - Height) / 2);
+        MaximizedBounds = area;
         BackColor = T.Window;
         KeyPreview = true;
-        DoubleBuffered = true;
-        SetStyle(ControlStyles.ResizeRedraw, true);
+        // Se pinta a mano en un búfer con alfa (ver OnPaint); el doble búfer de WinForms perdería la transparencia.
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        DoubleBuffered = false;
+
+        // Cristal: se mira lo que hay detrás antes de mostrar la ventana para elegir texto claro u oscuro.
+        moveTimer = new System.Windows.Forms.Timer { Interval = 140 };
+        moveTimer.Tick += delegate { moveTimer.Stop(); RefreshBackdrop(); Render(); };
+        if (T.Glass) RefreshBackdrop();
+    }
+
+    // Captura lo que hay detrás (las ventanas en capas, como esta, no salen en la captura),
+    // decide el color del texto según su luminosidad y guarda una copia desenfocada para el esmerilado.
+    void RefreshBackdrop()
+    {
+        if (!T.Glass) return;
+        try
+        {
+            var r = Bounds;
+            using (var shot = new Bitmap(r.Width, r.Height, PixelFormat.Format32bppArgb))
+            {
+                // La captura incluiría la propia ventana y sus colores se irían colando en el cristal cada vez
+                // que se rehace (al moverla cambiaba de color). Se excluye de la captura solo durante este
+                // instante, esperando a que Windows componga un fotograma sin ella.
+                bool exclude = IsHandleCreated && Visible;
+                if (exclude) { SetWindowDisplayAffinity(Handle, 0x11); DwmFlush(); }   // WDA_EXCLUDEFROMCAPTURE
+                try
+                {
+                    using (var g = Graphics.FromImage(shot)) g.CopyFromScreen(r.Location, Point.Empty, r.Size);
+                }
+                finally
+                {
+                    if (exclude) SetWindowDisplayAffinity(Handle, 0);                     // WDA_NONE
+                }
+                T.UseGlass(Luminance(shot));
+                if (backdrop != null) backdrop.Dispose();
+                backdrop = RadialMenu.Blur(shot);
+            }
+        }
+        catch { T.UseGlass(0.5); }
+    }
+
+    static double Luminance(Bitmap bmp)
+    {
+        double sum = 0;
+        int count = 0, step = Math.Max(8, Math.Min(bmp.Width, bmp.Height) / 24);
+        for (int y = step / 2; y < bmp.Height; y += step)
+            for (int x = step / 2; x < bmp.Width; x += step)
+            {
+                var c = bmp.GetPixel(x, y);
+                sum += (0.2126 * c.R + 0.7152 * c.G + 0.0722 * c.B) / 255;
+                count++;
+            }
+        return count == 0 ? 0.5 : sum / count;
+    }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            // Sin borde de Windows, pero con menú de sistema y minimizar: así la barra de tareas puede
+            // minimizar/restaurar la ventana y Alt+Espacio sigue funcionando.
+            cp.Style |= 0x00080000 | 0x00020000 | 0x00010000; // WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
+            // Con cristal, ventana en capas: cada píxel lleva su propia transparencia (como el menú).
+            if (T != null && T.Glass) cp.ExStyle |= 0x00080000;  // WS_EX_LAYERED
+            return cp;
+        }
     }
 
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
-        // Windows 11: barra de título oscura si toca, esquinas redondeadas y título del mismo color que la ventana.
-        int dark = T.Dark ? 1 : 0, round = 2, caption = T.Window.R | (T.Window.G << 8) | (T.Window.B << 16);
-        DwmSetWindowAttribute(Handle, 20, ref dark, 4);
-        DwmSetWindowAttribute(Handle, 33, ref round, 4);
-        DwmSetWindowAttribute(Handle, 35, ref caption, 4);
+        int round = 2;
+        DwmSetWindowAttribute(Handle, 33, ref round, 4);   // esquinas redondeadas de Windows 11 (sin cristal)
+    }
+
+    // --- Barra de título propia -------------------------------------------------------------
+
+    RectangleF LightRect(int i)
+    {
+        float d = 12 * S, gap = 8 * S;
+        return new RectangleF(16 * S + i * (d + gap), (titleHeight - d) / 2, d, d);
+    }
+
+    int LightAt(Point p)
+    {
+        for (int i = 0; i < 3; i++) if (RectangleF.Inflate(LightRect(i), 4 * S, 4 * S).Contains(p)) return i;
+        return -1;
+    }
+
+    void DrawTitleBar(Graphics g)
+    {
+        bool showGlyphs = hoverLight >= 0;
+        for (int i = 0; i < 3; i++)
+        {
+            var r = LightRect(i);
+            var c = LightColors[i];
+            if (i == pressedLight) c = Color.FromArgb(c.R * 4 / 5, c.G * 4 / 5, c.B * 4 / 5);
+            using (var b = new SolidBrush(c)) g.FillEllipse(b, r);
+            using (var p = new Pen(Color.FromArgb(40, 0, 0, 0), 1)) g.DrawEllipse(p, r);
+            if (!showGlyphs) continue;
+            // Los símbolos aparecen al pasar por encima, como en macOS.
+            using (var p = new Pen(Color.FromArgb(150, 0, 0, 0), 1.3f * S) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+            {
+                float cx = r.X + r.Width / 2, cy = r.Y + r.Height / 2, k = 2.8f * S;
+                if (i == 0) { g.DrawLine(p, cx - k, cy - k, cx + k, cy + k); g.DrawLine(p, cx - k, cy + k, cx + k, cy - k); }
+                else if (i == 1) g.DrawLine(p, cx - k, cy, cx + k, cy);
+                else { g.DrawLine(p, cx - k, cy, cx + k, cy); g.DrawLine(p, cx, cy - k, cx, cy + k); }
+            }
+        }
+        using (var f = T.Font(13f, true))
+        using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
+            T.DrawText(g, Text, f, new RectangleF(100 * S, 0, ClientSize.Width - 200 * S, titleHeight), sf, T.Text, true);
+    }
+
+    void PressLight(int i)
+    {
+        if (i == 0) Close();
+        else if (i == 1) WindowState = FormWindowState.Minimized;
+        else WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
+    }
+
+    // Arrastrar desde la barra y redimensionar desde los bordes, ya que la ventana no tiene marco de Windows.
+    protected override void WndProc(ref Message m)
+    {
+        const int WM_NCHITTEST = 0x84;
+        if (m.Msg == WM_NCHITTEST)
+        {
+            int lp = m.LParam.ToInt32();
+            var p = PointToClient(new Point((short)(lp & 0xFFFF), (short)((lp >> 16) & 0xFFFF)));
+            int edge = (int)(6 * S), w = ClientSize.Width, h = ClientSize.Height;
+            bool left = p.X < edge, right = p.X >= w - edge, top = p.Y < edge, bottom = p.Y >= h - edge;
+            if (WindowState == FormWindowState.Normal)
+            {
+                if (top && left) { m.Result = (IntPtr)13; return; }
+                if (top && right) { m.Result = (IntPtr)14; return; }
+                if (bottom && left) { m.Result = (IntPtr)16; return; }
+                if (bottom && right) { m.Result = (IntPtr)17; return; }
+                if (left) { m.Result = (IntPtr)10; return; }
+                if (right) { m.Result = (IntPtr)11; return; }
+                if (top) { m.Result = (IntPtr)12; return; }
+                if (bottom) { m.Result = (IntPtr)15; return; }
+            }
+            if (p.Y < titleHeight && LightAt(p) < 0) { m.Result = (IntPtr)2; return; }   // HTCAPTION
+            m.Result = (IntPtr)1;                                                           // HTCLIENT
+            return;
+        }
+        base.WndProc(ref m);
     }
 
     protected override void OnShown(EventArgs e)
@@ -397,7 +611,16 @@ abstract class EditorForm : Form
     protected override void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
+        // Al crear la ventana, Windows le descuenta un marco que no tiene: se le devuelve su tamaño y se centra.
+        if (ClientSize != intendedSize)
+        {
+            ClientSize = intendedSize;
+            var area = Screen.FromPoint(Cursor.Position).WorkingArea;
+            Location = new Point(area.X + (area.Width - Width) / 2, area.Y + (area.Height - Height) / 2);
+            RefreshBackdrop();
+        }
         PerformLayout();
+        Render();   // una ventana en capas no se ve hasta que se le da su primera imagen
     }
 
     protected override void OnLayout(LayoutEventArgs e)
@@ -407,31 +630,130 @@ abstract class EditorForm : Form
         if (Widgets.Count == 0) return;
         float m = 20 * S;
         PanelArea = new RectangleF(m, ClientSize.Height - panelHeight - m, ClientSize.Width - 2 * m, panelHeight);
-        PreviewArea = new RectangleF(m, m, ClientSize.Width - 2 * m, PanelArea.Top - 2 * m);
+        PreviewArea = new RectangleF(m, titleHeight, ClientSize.Width - 2 * m, PanelArea.Top - m - titleHeight);
         LayoutWidgets(PanelArea);
         Invalidate();
     }
 
     protected abstract void LayoutWidgets(RectangleF panel);
 
+    protected override void OnPaintBackground(PaintEventArgs e) { }
+
     protected override void OnPaint(PaintEventArgs e)
     {
-        var g = e.Graphics;
-        g.Clear(T.Window);
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+        if (T.Glass) { Render(); return; }
+        if (!DrawBuffer()) return;
+        // Sin cristal: el búfer se copia a la ventana como siempre.
+        IntPtr hbmp = buffer.GetHbitmap(Color.FromArgb(0));
+        IntPtr mem = CreateCompatibleDC(IntPtr.Zero);
+        IntPtr old = SelectObject(mem, hbmp);
+        IntPtr hdc = e.Graphics.GetHdc();
+        try { BitBlt(hdc, 0, 0, buffer.Width, buffer.Height, mem, 0, 0, 0x00CC0020); }
+        finally
+        {
+            e.Graphics.ReleaseHdc(hdc);
+            SelectObject(mem, old);
+            DeleteDC(mem);
+            DeleteObject(hbmp);
+        }
+    }
 
-        using (var path = Shapes.Rounded(PreviewArea, 12 * S))
-        using (var b = new SolidBrush(T.Canvas))
-            g.FillPath(b, path);
-        var clip = g.Clip;
-        using (var path = Shapes.Rounded(PreviewArea, 12 * S)) g.SetClip(path);
-        DrawPreview(g);
-        g.Clip = clip;
+    // Una ventana en capas no recibe WM_PAINT útil: cada Invalidate() programa un redibujado
+    // (agrupado, para no repetirlo varias veces por movimiento del ratón).
+    protected override void OnInvalidated(InvalidateEventArgs e)
+    {
+        base.OnInvalidated(e);
+        if (!T.Glass || renderQueued || !IsHandleCreated) return;
+        renderQueued = true;
+        BeginInvoke(new Action(() => { renderQueued = false; Render(); }));
+    }
 
-        foreach (var w in Widgets.Where(w => w.Visible)) w.Draw(g, T);
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        if (T.Glass && IsHandleCreated && WindowState != FormWindowState.Minimized) { RefreshBackdrop(); Render(); }
+    }
+
+    protected override void OnMove(EventArgs e)
+    {
+        base.OnMove(e);
+        // Al terminar de mover la ventana se vuelve a mirar qué hay detrás.
+        // (moveTimer aún no existe mientras el constructor coloca la ventana.)
+        if (!T.Glass || moveTimer == null) return;
+        // Mientras se arrastra, el desenfoque se rehace como mucho cada 50 ms para que el fondo acompañe
+        // a la ventana; al soltarla, una última vez.
+        if (IsHandleCreated && moveClock.ElapsedMilliseconds > 50)
+        {
+            moveClock.Restart();
+            RefreshBackdrop();
+            Render();
+        }
+        moveTimer.Stop();
+        moveTimer.Start();
+    }
+
+    void Render()
+    {
+        if (!T.Glass || !IsHandleCreated || WindowState == FormWindowState.Minimized) return;
+        if (DrawBuffer()) Native.ApplyLayeredBitmap(this, buffer);
+    }
+
+    bool DrawBuffer()
+    {
+        if (ClientSize.Width < 1 || ClientSize.Height < 1 || Widgets.Count == 0) return false;
+        if (buffer == null || buffer.Size != ClientSize)
+        {
+            if (buffer != null) buffer.Dispose();
+            buffer = new Bitmap(ClientSize.Width, ClientSize.Height, PixelFormat.Format32bppPArgb);
+        }
+
+        using (var g = Graphics.FromImage(buffer))
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            // ClearType no sirve sobre fondo transparente (deja bordes de color); suavizado normal.
+            g.TextRenderingHint = T.Glass ? System.Drawing.Text.TextRenderingHint.AntiAliasGridFit : System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+
+            var whole = new RectangleF(0, 0, ClientSize.Width, ClientSize.Height);
+            bool rounded = T.Glass && WindowState == FormWindowState.Normal;
+            float radius = rounded ? 12 * S : 0;
+            using (var shape = Shapes.Rounded(RectangleF.Inflate(whole, -0.5f, -0.5f), radius))
+            {
+                if (T.Glass)
+                {
+                    // Cristal: esquinas redondeadas propias, esmerilado al 15 % y tinte ligero.
+                    g.Clear(Color.Transparent);
+                    g.SetClip(shape);
+                    if (backdrop != null)
+                    {
+                        using (var attrs = new ImageAttributes())
+                        {
+                            attrs.SetColorMatrix(new ColorMatrix { Matrix33 = EditorTheme.Frost });
+                            g.DrawImage(backdrop, new Rectangle(0, 0, buffer.Width, buffer.Height), 0, 0, backdrop.Width, backdrop.Height, GraphicsUnit.Pixel, attrs);
+                        }
+                    }
+                    using (var b = new SolidBrush(T.Window)) g.FillPath(b, shape);
+                }
+                else g.Clear(T.Window);
+
+                DrawTitleBar(g);
+                using (var path = Shapes.Rounded(PreviewArea, 12 * S))
+                using (var b = new SolidBrush(T.Canvas))
+                    g.FillPath(b, path);
+                var clip = g.Clip;
+                using (var path = Shapes.Rounded(PreviewArea, 12 * S)) g.SetClip(path, CombineMode.Intersect);
+                DrawPreview(g);
+                g.Clip = clip;
+
+                foreach (var w in Widgets.Where(w => w.Visible)) w.Draw(g, T);
+                g.ResetClip();
+
+                // Borde fino de luz alrededor de la ventana.
+                using (var p = new Pen(T.Separator, 1)) g.DrawPath(p, shape);
+            }
+        }
+        return true;
     }
 
     protected virtual void DrawPreview(Graphics g)
@@ -515,6 +837,8 @@ abstract class EditorForm : Form
     {
         base.OnMouseDown(e);
         if (e.Button != MouseButtons.Left) return;
+        pressedLight = LightAt(e.Location);
+        if (pressedLight >= 0) { Invalidate(); return; }
         active = Widgets.LastOrDefault(w => w.Visible && w.Bounds.Contains(e.Location));
         if (active != null) active.Down(e.Location);
         else if (PreviewArea.Contains(e.Location)) { previewDown = true; PreviewDown(e.Location); }
@@ -524,14 +848,30 @@ abstract class EditorForm : Form
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
+        int light = LightAt(e.Location) >= 0 ? 0 : -1;   // al pasar por cualquiera se ven los tres símbolos
+        if (light != hoverLight) { hoverLight = light; Invalidate(new Rectangle(0, 0, (int)(100 * S), (int)titleHeight)); }
         if (active != null) { active.Drag(e.Location); Invalidate(); return; }
         if (previewDown) { PreviewDrag(e.Location); Invalidate(); }
         Cursor = PreviewArea.Contains(e.Location) || previewDown ? PreviewCursor(e.Location) : Cursors.Default;
     }
 
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        base.OnMouseLeave(e);
+        if (hoverLight >= 0) { hoverLight = -1; Invalidate(); }
+    }
+
     protected override void OnMouseUp(MouseEventArgs e)
     {
         base.OnMouseUp(e);
+        if (pressedLight >= 0)
+        {
+            int i = pressedLight;
+            pressedLight = -1;
+            Invalidate();
+            if (LightAt(e.Location) == i) PressLight(i);
+            return;
+        }
         if (active != null) { var w = active; active = null; w.Up(e.Location); }
         else if (previewDown) { previewDown = false; PreviewUp(e.Location); }
         Invalidate();
@@ -620,6 +960,9 @@ abstract class EditorForm : Form
         {
             if (Original != null) Original.Dispose();
             if (PreviewBase != null) PreviewBase.Dispose();
+            if (buffer != null) buffer.Dispose();
+            if (backdrop != null) backdrop.Dispose();
+            moveTimer.Dispose();
         }
         base.Dispose(disposing);
     }
@@ -1464,13 +1807,14 @@ class MetadataWindow : EditorForm
         if (hasGps)
         {
             var banner = new RectangleF(x, y, w, 40 * S);
+            // Aviso: naranja sólido con texto blanco, para que destaque aunque la ventana sea de cristal.
             using (var path = Shapes.Rounded(banner, 10 * S))
-            using (var b = new SolidBrush(Color.FromArgb(T.Dark ? 60 : 36, 255, 149, 0)))
+            using (var b = new SolidBrush(T.Glass ? Color.FromArgb(230, 255, 149, 0) : Color.FromArgb(T.Dark ? 60 : 36, 255, 149, 0)))
                 g.FillPath(b, path);
+            var bannerText = T.Glass ? Color.White : Color.FromArgb(T.Dark ? 255 : 200, T.Dark ? 255 : 160, T.Dark ? 179 : 80, 0);
             using (var f = T.Font(12.5f, true))
-            using (var b = new SolidBrush(Color.FromArgb(T.Dark ? 255 : 200, T.Dark ? 255 : 160, T.Dark ? 179 : 80, 0)))
             using (var sf = new StringFormat { LineAlignment = StringAlignment.Center })
-                g.DrawString("Esta foto revela dónde se hizo (GPS).", f, b, RectangleF.Inflate(banner, -12 * S, 0), sf);
+                T.DrawText(g, "Esta foto revela dónde se hizo (GPS).", f, RectangleF.Inflate(banner, -12 * S, 0), sf, bannerText, false);
             y += 52 * S;
         }
 
@@ -1485,8 +1829,8 @@ class MetadataWindow : EditorForm
             foreach (var row in rows)
             {
                 if (y + rowH > area.Bottom) break;
-                g.DrawString(row.Key, fName, bName, new RectangleF(x, y, w * 0.42f, rowH), near);
-                g.DrawString(row.Value, fValue, bValue, new RectangleF(x + w * 0.42f, y, w * 0.58f, rowH), far);
+                T.DrawText(g, row.Key, fName, new RectangleF(x, y, w * 0.42f, rowH), near, T.Secondary, true);
+                T.DrawText(g, row.Value, fValue, new RectangleF(x + w * 0.42f, y, w * 0.58f, rowH), far, T.Text, true);
                 y += rowH;
                 g.DrawLine(sep, x, y, x + w, y);
             }

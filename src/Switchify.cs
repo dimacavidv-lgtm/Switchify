@@ -302,6 +302,7 @@ class Look
 {
     public bool Dark, Solid, Motion;
     public Color Tint, Center, Text, Secondary, Separator, Accent, AccentPressed, OnAccent, Edge, Halo;
+    public float Frost;   // opacidad de la copia desenfocada del fondo (0 = el fondo real se ve tal cual)
 
     [DllImport("user32.dll")] static extern bool SystemParametersInfo(int action, int param, out bool value, int winIni);
 
@@ -318,8 +319,10 @@ class Look
 
         if (look.Dark)
         {
-            look.Tint = Color.FromArgb(look.Solid ? 250 : 45, 30, 30, 32);
-            look.Center = Color.FromArgb(look.Solid ? 255 : 110, 44, 44, 46);
+            // Cristal esmerilado: el fondo de detrás se ve entero pero difuminado, con un tinte del 15 %.
+            look.Frost = look.Solid ? 0 : 1f;
+            look.Tint = Color.FromArgb(look.Solid ? 250 : 42, 30, 30, 32);
+            look.Center = Color.FromArgb(look.Solid ? 255 : 64, 44, 44, 46);
             look.Halo = Color.FromArgb(look.Solid ? 0 : 120, 0, 0, 0);
             look.Text = Color.FromArgb(235, 255, 255, 255);
             look.Secondary = Color.FromArgb(150, 235, 235, 245);
@@ -330,8 +333,9 @@ class Look
         }
         else
         {
-            look.Tint = Color.FromArgb(look.Solid ? 250 : 28, 250, 250, 252);
-            look.Center = Color.FromArgb(look.Solid ? 255 : 100, 255, 255, 255);
+            look.Frost = look.Solid ? 0 : 1f;
+            look.Tint = Color.FromArgb(look.Solid ? 250 : 38, 250, 250, 252);
+            look.Center = Color.FromArgb(look.Solid ? 255 : 64, 255, 255, 255);
             look.Halo = Color.FromArgb(look.Solid ? 0 : 130, 255, 255, 255);
             look.Text = Color.FromArgb(220, 0, 0, 0);
             look.Secondary = Color.FromArgb(150, 60, 60, 67);
@@ -355,7 +359,7 @@ class Look
             Secondary = Color.FromArgb(175, 235, 235, 245);
             Separator = Color.FromArgb(40, 255, 255, 255);
             Halo = Color.FromArgb(110, 0, 0, 0);
-            Center = Color.FromArgb(110, 44, 44, 46);
+            Center = Color.FromArgb(64, 44, 44, 46);
             Edge = Color.FromArgb(70, 255, 255, 255);
         }
         else if (Dark && luminance > 0.7)
@@ -364,7 +368,7 @@ class Look
             Secondary = Color.FromArgb(160, 60, 60, 67);
             Separator = Color.FromArgb(40, 60, 60, 67);
             Halo = Color.FromArgb(130, 255, 255, 255);
-            Center = Color.FromArgb(100, 255, 255, 255);
+            Center = Color.FromArgb(64, 255, 255, 255);
         }
     }
 
@@ -457,6 +461,8 @@ class RadialMenu : Form
     Bitmap backdrop;                                    // lo que hay detrás, ya desenfocado
     Bitmap frame, scene, baseLayer;                     // bitmaps reutilizados entre fotogramas
     GraphicsPath[] labelPaths;                          // texto de cada etiqueta, ya convertido en trazado
+    bool[] labelLight;                                  // por etiqueta: texto claro (fondo oscuro detrás) u oscuro
+    bool centerLight;
     readonly Font primaryFont, secondaryFont;
     readonly StringFormat centered = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
     readonly StringFormat above = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Far, Trimming = StringTrimming.EllipsisCharacter };
@@ -869,7 +875,7 @@ class RadialMenu : Form
         return count == 0 ? 0.5 : sum / count;
     }
 
-    static Bitmap Blur(Bitmap src)
+    public static Bitmap Blur(Bitmap src)
     {
         // Desenfoque barato y suave: reducir mucho y volver a ampliar con bicúbico.
         // Se satura un poco (como el "vibrancy" de Apple) para que el color de detrás se note a través del cristal.
@@ -1020,12 +1026,21 @@ class RadialMenu : Form
                     g.FillEllipse(b, RectangleF.Inflate(new RectangleF(outer.X, outer.Y + 6 * scale, outer.Width, outer.Height), i, i));
             }
 
-            // Material: fondo desenfocado + tinte translúcido.
+            // Material: el fondo real se ve a través del anillo. Encima, solo un velo de la copia desenfocada
+            // (un toque de esmerilado) y el tinte. Bajo el cristal se borra la sombra para que no lo oscurezca.
             using (var disk = new GraphicsPath())
             {
                 disk.AddEllipse(outer);
                 g.SetClip(disk);
-                if (backdrop != null) g.DrawImage(backdrop, 0, 0, Width, Height);
+                g.Clear(Color.Transparent);
+                if (backdrop != null && look.Frost > 0)
+                {
+                    using (var attrs = new ImageAttributes())
+                    {
+                        attrs.SetColorMatrix(new ColorMatrix { Matrix33 = look.Frost });
+                        g.DrawImage(backdrop, new Rectangle(0, 0, Width, Height), 0, 0, Width, Height, GraphicsUnit.Pixel, attrs);
+                    }
+                }
                 using (var tint = new SolidBrush(look.Tint)) g.FillPath(tint, disk);
                 g.ResetClip();
             }
@@ -1056,6 +1071,7 @@ class RadialMenu : Form
     {
         int n = actions.Count;
         labelPaths = new GraphicsPath[n];
+        labelLight = new bool[n];
         float labelSize = (n > 8 ? 12.5f : 14f) * scale;
         float r = (outerR + innerR) / 2f;
         using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
@@ -1076,8 +1092,15 @@ class RadialMenu : Form
                     path.AddString(actions[i].Label, labelFont, (int)FontStyle.Regular, labelSize, box, sf);
                 }
                 labelPaths[i] = path;
+                labelLight[i] = RegionLuminance(new RectangleF(c.X - 44 * scale, c.Y - 24 * scale, 88 * scale, 48 * scale)) < 0.5;
             }
         }
+
+        // El centro tiene su propio velo: cuenta en lo que se ve detrás del texto.
+        var inner = new RectangleF(center - innerR * 0.7f, center - innerR * 0.5f, innerR * 1.4f, innerR);
+        double a = look.Center.A / 255.0;
+        double centerLum = (0.2126 * look.Center.R + 0.7152 * look.Center.G + 0.0722 * look.Center.B) / 255;
+        centerLight = RegionLuminance(inner) * (1 - a) + centerLum * a < 0.5;
     }
 
     void DrawScene(Graphics g)
@@ -1122,25 +1145,29 @@ class RadialMenu : Form
             double mid = MidAngle(i);
             float shift = 3 * scale * hv - 14 * scale * (1 - li);
             float dx = (float)Math.Cos(mid) * shift, dy = (float)Math.Sin(mid) * shift;
-            var color = Lerp(look.Text, look.OnAccent, hv);
+            // Cada etiqueta usa el color que contrasta con lo que tiene justo detrás.
+            Color text, halo;
+            Vibrancy(labelLight[i], out text, out halo);
+            var color = Lerp(text, look.OnAccent, hv);
             color = Color.FromArgb((int)(color.A * li), color);
+            float haloK = li * Math.Max(0, 1 - hv * 2);   // sobre el color de acento no hace falta halo
 
             var state = g.Save();
             g.TranslateTransform(dx, dy);
-            // Halo suave del color contrario: el texto se lee aunque el cristal sea muy transparente.
-            float haloK = li * Math.Max(0, 1 - hv * 2);
-            if (haloK > 0.01f)
-            {
-                using (var halo = new Pen(Color.FromArgb((int)(look.Halo.A * haloK), look.Halo), 3f * scale) { LineJoin = LineJoin.Round })
-                    g.DrawPath(halo, labelPaths[i]);
-            }
+            if (haloK > 0.01f) DrawHalo(g, labelPaths[i], halo, haloK);
             using (var brush = new SolidBrush(color)) g.FillPath(brush, labelPaths[i]);
             g.Restore(state);
 
             if (actions[i].Icon != null)
             {
                 var c = new PointF(center + (float)Math.Cos(mid) * r + dx, center + (float)Math.Sin(mid) * r + dy);
-                Icons.Draw(g, actions[i].Icon, new PointF(c.X, c.Y - 9 * scale), 20 * scale, color);
+                var iconPos = new PointF(c.X, c.Y - 9 * scale);
+                if (haloK > 0.01f)
+                {
+                    Icons.Draw(g, actions[i].Icon, iconPos, 20 * scale, Color.FromArgb((int)(halo.A * haloK * 0.35f), halo), 4.2f);
+                    Icons.Draw(g, actions[i].Icon, iconPos, 20 * scale, Color.FromArgb((int)(halo.A * haloK), halo), 2.4f);
+                }
+                Icons.Draw(g, actions[i].Icon, iconPos, 20 * scale, color, 1f);
             }
         }
 
@@ -1159,12 +1186,56 @@ class RadialMenu : Form
         var top = new RectangleF(textBox.X, textBox.Y, textBox.Width, textBox.Height / 2 + 6 * scale - gap);
         var bottom = new RectangleF(textBox.X, textBox.Y + textBox.Height / 2 + 6 * scale + gap, textBox.Width, textBox.Height / 2 - 6 * scale);
         if (secondary.Length == 0) top = textBox;
-        using (var b1 = new SolidBrush(look.Text))
-        using (var b2 = new SolidBrush(look.Secondary))
+
+        Color ctext, chalo;
+        Vibrancy(centerLight, out ctext, out chalo);
+        var csecondary = Color.FromArgb(ctext.A * 2 / 3, ctext);
+        using (var p1 = new GraphicsPath())
+        using (var p2 = new GraphicsPath())
         {
-            g.DrawString(primary, primaryFont, b1, top, secondary.Length == 0 ? centered : above);
-            if (secondary.Length > 0) g.DrawString(secondary, secondaryFont, b2, bottom, below);
+            p1.AddString(primary, labelFont, (int)FontStyle.Regular, 12.5f * scale, top, secondary.Length == 0 ? centered : above);
+            if (secondary.Length > 0) p2.AddString(secondary, textFont, (int)FontStyle.Regular, 11f * scale, bottom, below);
+            DrawHalo(g, p1, chalo, 0.8f);
+            DrawHalo(g, p2, chalo, 0.6f);
+            using (var b1 = new SolidBrush(ctext)) g.FillPath(b1, p1);
+            using (var b2 = new SolidBrush(csecondary)) g.FillPath(b2, p2);
         }
+    }
+
+    // Texto claro sobre fondos oscuros y oscuro sobre fondos claros, cada uno con su halo contrario.
+    static void Vibrancy(bool lightText, out Color text, out Color halo)
+    {
+        text = lightText ? Color.FromArgb(245, 255, 255, 255) : Color.FromArgb(230, 0, 0, 0);
+        halo = lightText ? Color.FromArgb(170, 0, 0, 0) : Color.FromArgb(200, 255, 255, 255);
+    }
+
+    // Halo doble: un resplandor ancho y suave más un contorno fino y firme.
+    void DrawHalo(Graphics g, GraphicsPath path, Color halo, float k)
+    {
+        using (var glow = new Pen(Color.FromArgb((int)(halo.A * k * 0.35f), halo), 6.5f * scale) { LineJoin = LineJoin.Round })
+            g.DrawPath(glow, path);
+        using (var line = new Pen(Color.FromArgb((int)(halo.A * k), halo), 3f * scale) { LineJoin = LineJoin.Round })
+            g.DrawPath(line, path);
+    }
+
+    // Luminosidad media (0..1) del fondo en una zona; sin fondo capturado, la del tema.
+    double RegionLuminance(RectangleF r)
+    {
+        if (backdrop == null) return look.Dark ? 0.1 : 0.9;
+        double sum = 0;
+        int count = 0;
+        for (int iy = 0; iy < 5; iy++)
+        {
+            for (int ix = 0; ix < 7; ix++)
+            {
+                int x = (int)(r.X + r.Width * (ix + 0.5f) / 7), y = (int)(r.Y + r.Height * (iy + 0.5f) / 5);
+                if (x < 0 || y < 0 || x >= backdrop.Width || y >= backdrop.Height) continue;
+                var c = backdrop.GetPixel(x, y);
+                sum += (0.2126 * c.R + 0.7152 * c.G + 0.0722 * c.B) / 255;
+                count++;
+            }
+        }
+        return count == 0 ? 0.5 : sum / count;
     }
 
     // Pieza del anillo, recortada hacia dentro para que el trazo redondeado no se salga del borde.
@@ -1221,13 +1292,14 @@ class FileAction
 // Símbolos de línea, al estilo de los SF Symbols: trazo redondeado, dibujados en una caja de `size`.
 static class Icons
 {
-    public static void Draw(Graphics g, string name, PointF c, float size, Color color)
+    public static void Draw(Graphics g, string name, PointF c, float size, Color color, float stroke)
     {
         float u = size / 20f;  // unidad: la caja mide 20×20
         Func<float, float, PointF> P = (x, y) => new PointF(c.X + (x - 10) * u, c.Y + (y - 10) * u);
         Func<float, float, float, float, RectangleF> Rc = (x, y, w, h) => new RectangleF(c.X + (x - 10) * u, c.Y + (y - 10) * u, w * u, h * u);
 
-        using (var pen = new Pen(color, 1.7f * u) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+        // `stroke` engrosa el trazo (se usa para dibujar el halo debajo del símbolo).
+        using (var pen = new Pen(color, 1.7f * u * stroke) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
         using (var fill = new SolidBrush(color))
         {
             switch (name)
