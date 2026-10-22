@@ -4,6 +4,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
@@ -293,32 +294,114 @@ static class ExplorerSelection
 // Menú radial
 // ---------------------------------------------------------------------------------------------
 
+// Apariencia del sistema: claro/oscuro, transparencias y animaciones según la configuración de Windows.
+class Look
+{
+    public bool Dark, Solid, Motion;
+    public Color Tint, Center, Text, Secondary, Separator, Accent, AccentPressed, OnAccent, Edge;
+
+    [DllImport("user32.dll")] static extern bool SystemParametersInfo(int action, int param, out bool value, int winIni);
+
+    public static Look Current()
+    {
+        var look = new Look
+        {
+            Dark = ReadDword(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme", 1) == 0,
+            Solid = ReadDword(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "EnableTransparency", 1) == 0,
+            Motion = true
+        };
+        bool animations;
+        if (SystemParametersInfo(0x1042 /* SPI_GETCLIENTAREAANIMATION */, 0, out animations, 0)) look.Motion = animations;
+
+        if (look.Dark)
+        {
+            look.Tint = Color.FromArgb(look.Solid ? 250 : 85, 30, 30, 32);
+            look.Center = Color.FromArgb(look.Solid ? 255 : 150, 44, 44, 46);
+            look.Text = Color.FromArgb(235, 255, 255, 255);
+            look.Secondary = Color.FromArgb(150, 235, 235, 245);
+            look.Separator = Color.FromArgb(30, 255, 255, 255);
+            look.Accent = Color.FromArgb(10, 132, 255);
+            look.AccentPressed = Color.FromArgb(0, 104, 214);
+            look.Edge = Color.FromArgb(45, 255, 255, 255);
+        }
+        else
+        {
+            look.Tint = Color.FromArgb(look.Solid ? 250 : 60, 250, 250, 252);
+            look.Center = Color.FromArgb(look.Solid ? 255 : 140, 255, 255, 255);
+            look.Text = Color.FromArgb(220, 0, 0, 0);
+            look.Secondary = Color.FromArgb(150, 60, 60, 67);
+            look.Separator = Color.FromArgb(40, 60, 60, 67);
+            look.Accent = Color.FromArgb(0, 122, 255);
+            look.AccentPressed = Color.FromArgb(0, 96, 210);
+            look.Edge = Color.FromArgb(140, 255, 255, 255);
+        }
+        look.OnAccent = Color.White;
+        return look;
+    }
+
+    static int ReadDword(string key, string name, int fallback)
+    {
+        try
+        {
+            using (var k = Registry.CurrentUser.OpenSubKey(key))
+            {
+                object v = k == null ? null : k.GetValue(name);
+                return v is int ? (int)v : fallback;
+            }
+        }
+        catch { return fallback; }
+    }
+}
+
+// Muelle con los parámetros de Apple: amortiguación (1 = sin rebote) y respuesta (segundos).
+// Siempre parte del valor actual, así que cualquier animación se puede interrumpir y redirigir.
+class Spring
+{
+    public double Value, Velocity, Target;
+    readonly double stiffness, damping;
+
+    public Spring(double dampingRatio, double response)
+    {
+        stiffness = Math.Pow(2 * Math.PI / response, 2);
+        damping = 4 * Math.PI * dampingRatio / response;
+    }
+
+    public void Step(double dt)
+    {
+        // Subpasos de 2 ms: integración estable aunque el temporizador vaya irregular.
+        for (double t = 0; t < dt; t += 0.002)
+        {
+            double h = Math.Min(0.002, dt - t);
+            Velocity += (-stiffness * (Value - Target) - damping * Velocity) * h;
+            Value += Velocity * h;
+        }
+    }
+
+    public bool Settled { get { return Math.Abs(Value - Target) < 0.002 && Math.Abs(Velocity) < 0.02; } }
+
+    public void Snap(double v)
+    {
+        Value = Target = v;
+        Velocity = 0;
+    }
+}
+
 static class Theme
 {
-    public static readonly Color RingLight = Color.FromArgb(255, 196, 120);
-    public static readonly Color RingDark = Color.FromArgb(255, 128, 72);
-    public static readonly Color Hover = Color.FromArgb(232, 67, 28);
-    public static readonly Color Text = Color.FromArgb(92, 40, 16);
-    public static readonly Color Center = Color.FromArgb(255, 246, 236);
-
     public static Icon MakeTrayIcon()
     {
         using (var bmp = new Bitmap(32, 32))
         using (var g = Graphics.FromImage(bmp))
         {
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            using (var brush = new LinearGradientBrush(new Rectangle(0, 0, 32, 32), RingLight, Hover, 45f))
+            using (var brush = new LinearGradientBrush(new Rectangle(0, 0, 32, 32), Color.FromArgb(64, 156, 255), Color.FromArgb(0, 102, 230), 90f))
                 g.FillEllipse(brush, 1, 1, 30, 30);
-            using (var pen = new Pen(Color.White, 2.5f))
+            using (var pen = new Pen(Color.White, 2.2f))
             {
+                // Seis segmentos del anillo, como el menú.
                 for (int i = 0; i < 6; i++)
-                {
-                    double a = i * Math.PI / 3;
-                    g.DrawLine(pen, 16 + (float)(Math.Cos(a) * 6), 16 + (float)(Math.Sin(a) * 6),
-                                    16 + (float)(Math.Cos(a) * 14), 16 + (float)(Math.Sin(a) * 14));
-                }
+                    g.DrawArc(pen, 7, 7, 18, 18, -90 + i * 60 + 8, 44);
             }
-            g.FillEllipse(Brushes.White, 12, 12, 8, 8);
             return Icon.FromHandle(bmp.GetHicon());
         }
     }
@@ -328,22 +411,32 @@ class RadialMenu : Form
 {
     public event Action<string, string, bool> ActionFinished;
 
+    static readonly string[] FontNames = { "Segoe UI Variable Text Semibold", "Segoe UI Semibold", "Segoe UI" };
+    static readonly string[] TextFontNames = { "Segoe UI Variable Text", "Segoe UI" };
+
     readonly float scale;
     readonly int outerR, innerR, pad, center;
-    readonly System.Windows.Forms.Timer releaseTimer;
+    readonly System.Windows.Forms.Timer releaseTimer, frameTimer;
+    readonly Stopwatch clock = new Stopwatch();
+    readonly Spring appear = new Spring(1.0, 0.32);   // entrada/salida: sin rebote
+    readonly FontFamily labelFont, textFont;
+    Spring[] hovers = new Spring[0];                    // resaltado de cada opción
     List<FileAction> actions = new List<FileAction>();
     List<string> files = new List<string>();
-    int hover = -1;
-    bool dragMode;
-    bool revealed;
+    Look look = Look.Current();
+    Bitmap backdrop;                                    // lo que hay detrás, ya desenfocado
+    int hover = -1, pressed = -1;
+    bool dragMode, revealed, closing;
 
     public RadialMenu()
     {
         using (var g = Graphics.FromHwnd(IntPtr.Zero)) scale = g.DpiX / 96f;
         outerR = (int)(170 * scale);
-        innerR = (int)(56 * scale);
-        pad = (int)(12 * scale);           // margen para la sombra
+        innerR = (int)(62 * scale);
+        pad = (int)(28 * scale);           // margen para la sombra
         center = outerR + pad;
+        labelFont = PickFont(FontNames);
+        textFont = PickFont(TextFontNames);
 
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
@@ -353,12 +446,22 @@ class RadialMenu : Form
         KeyPreview = true;
         ClientSize = new Size(center * 2, center * 2);
 
-        releaseTimer = new System.Windows.Forms.Timer { Interval = 40 };
+        releaseTimer = new System.Windows.Forms.Timer { Interval = 30 };
         releaseTimer.Tick += delegate
         {
             // En modo arrastre el menú vive mientras el botón siga apretado.
             if (dragMode && !Native.LeftButtonDown()) HideMenu();
         };
+
+        frameTimer = new System.Windows.Forms.Timer { Interval = 10 };
+        frameTimer.Tick += delegate { Animate(); };
+    }
+
+    static FontFamily PickFont(string[] names)
+    {
+        var installed = FontFamily.Families.Select(f => f.Name).ToList();
+        string name = names.FirstOrDefault(installed.Contains) ?? "Segoe UI";
+        return new FontFamily(name);
     }
 
     protected override bool ShowWithoutActivation { get { return true; } }
@@ -386,17 +489,29 @@ class RadialMenu : Form
         Location = new Point(x, y);
     }
 
+    void Prepare(List<string> selected)
+    {
+        look = Look.Current();
+        closing = false;
+        pressed = -1;
+        hover = -1;
+        files = selected;
+        SetActions(FileActions.For(files));
+        PlaceAtCursor();
+        // El fondo se captura antes de mostrar la ventana (las ventanas en capas no salen en la captura).
+        if (backdrop != null) backdrop.Dispose();
+        backdrop = look.Solid ? null : CaptureBackdrop();
+        appear.Snap(0);
+    }
+
     public void ShowForDrag()
     {
-        if (Visible) return;
+        if (Visible && !closing) return;
         dragMode = true;
-        files = new List<string>();
-        actions = new List<FileAction>();
-        hover = -1;
+        Prepare(new List<string>());
         // Invisible hasta que Windows confirme que se está arrastrando un archivo (DragEnter).
         // Así no aparece si Shift se pulsa durante otra cosa (p. ej. seleccionar texto).
         revealed = false;
-        PlaceAtCursor();
         Show();
         Render();
         releaseTimer.Start();
@@ -405,23 +520,40 @@ class RadialMenu : Form
     public void ShowForFiles(List<string> selected)
     {
         dragMode = false;
-        files = selected;
-        actions = FileActions.For(files);
-        hover = -1;
+        Prepare(selected);
         revealed = true;
-        PlaceAtCursor();
         Show();
-        Render();
+        Reveal();
         Activate();
         Native.SetForegroundWindow(Handle);
+    }
+
+    void Reveal()
+    {
+        revealed = true;
+        appear.Target = 1;
+        StartAnimation();
     }
 
     void HideMenu()
     {
         releaseTimer.Stop();
-        Hide();
-        hover = -1;
         dragMode = false;
+        if (!Visible || closing) return;
+        if (!revealed) { Finish(); return; }
+        // Sale por el mismo camino por el que entró: se encoge hacia el cursor.
+        closing = true;
+        appear.Target = 0;
+        StartAnimation();
+    }
+
+    void Finish()
+    {
+        frameTimer.Stop();
+        closing = false;
+        revealed = false;
+        Hide();
+        if (backdrop != null) { backdrop.Dispose(); backdrop = null; }
     }
 
     protected override void OnDeactivate(EventArgs e)
@@ -436,17 +568,56 @@ class RadialMenu : Form
         base.OnKeyDown(e);
     }
 
+    // --- Animación -----------------------------------------------------------------------
+
+    void StartAnimation()
+    {
+        if (frameTimer.Enabled) return;
+        clock.Restart();
+        frameTimer.Start();
+    }
+
+    void Animate()
+    {
+        double dt = Math.Min(0.05, clock.Elapsed.TotalSeconds);
+        clock.Restart();
+        appear.Step(dt);
+        foreach (var h in hovers) h.Step(dt);
+        Render();
+
+        if (closing && appear.Value < 0.02) { Finish(); return; }
+        if (appear.Settled && hovers.All(h => h.Settled)) frameTimer.Stop();
+    }
+
+    void SetActions(List<FileAction> list)
+    {
+        actions = list;
+        hovers = list.Select(a => new Spring(1.0, 0.18)).ToArray();
+    }
+
+    void SetHover(int index)
+    {
+        // Al cerrar, la opción elegida se queda resaltada mientras el menú se va.
+        if (closing || index == hover) return;
+        hover = index;
+        if (pressed != index) pressed = -1;
+        for (int i = 0; i < hovers.Length; i++) hovers[i].Target = i == index ? 1 : 0;
+        StartAnimation();
+    }
+
     // --- Arrastrar y soltar --------------------------------------------------------------
 
     protected override void OnDragEnter(DragEventArgs e)
     {
         var dropped = e.Data.GetData(DataFormats.FileDrop) as string[];
         if (dropped == null || dropped.Length == 0) { e.Effect = DragDropEffects.None; return; }
-        files = dropped.ToList();
-        actions = FileActions.For(files);
-        revealed = true;
-        hover = HitTest(PointToClient(new Point(e.X, e.Y)));
-        Render();
+        if (!revealed || closing)
+        {
+            files = dropped.ToList();
+            SetActions(FileActions.For(files));
+            closing = false;
+            Reveal();
+        }
         UpdateDrag(e);
     }
 
@@ -477,12 +648,23 @@ class RadialMenu : Form
         if (!dragMode) SetHover(HitTest(e.Location));
     }
 
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        // La respuesta llega al pulsar, no al soltar.
+        if (dragMode || e.Button != MouseButtons.Left || closing) return;
+        pressed = HitTest(e.Location);
+        Render();
+    }
+
     protected override void OnMouseUp(MouseEventArgs e)
     {
         base.OnMouseUp(e);
-        if (dragMode || e.Button != MouseButtons.Left) return;
+        if (dragMode || e.Button != MouseButtons.Left || closing) return;
         int chosen = HitTest(e.Location);
         var selected = files;
+        if (chosen >= 0 && chosen != pressed) { pressed = -1; Render(); return; } // soltó en otra opción: se cancela
+        pressed = -1;
         HideMenu();
         if (chosen >= 0) Execute(actions[chosen], selected);
     }
@@ -522,7 +704,7 @@ class RadialMenu : Form
         });
     }
 
-    // --- Geometría y dibujo --------------------------------------------------------------
+    // --- Geometría -----------------------------------------------------------------------
 
     int HitTest(Point p)
     {
@@ -536,15 +718,79 @@ class RadialMenu : Form
         return Math.Min(actions.Count - 1, (int)(rel / sweep));
     }
 
-    void SetHover(int index)
+    // --- Material: captura del fondo desenfocada y saturada --------------------------------
+
+    Bitmap CaptureBackdrop()
     {
-        if (index == hover) return;
-        hover = index;
-        Render();
+        try
+        {
+            using (var shot = new Bitmap(Width, Height, PixelFormat.Format32bppArgb))
+            {
+                using (var g = Graphics.FromImage(shot)) g.CopyFromScreen(Location, Point.Empty, Size);
+                return Blur(shot);
+            }
+        }
+        catch { return null; }
     }
 
+    static Bitmap Blur(Bitmap src)
+    {
+        // Desenfoque barato y suave: reducir mucho y volver a ampliar con bicúbico.
+        // Se satura un poco (como el "vibrancy" de Apple) para que el color de detrás se note a través del cristal.
+        const float s = 1.6f;
+        float[] lum = { 0.2126f, 0.7152f, 0.0722f };
+        var m = new float[5][];
+        for (int r = 0; r < 3; r++)
+        {
+            m[r] = new float[5];
+            for (int c = 0; c < 3; c++) m[r][c] = (1 - s) * lum[r] + (r == c ? s : 0);
+        }
+        m[3] = new float[] { 0, 0, 0, 1, 0 };
+        m[4] = new float[] { 0, 0, 0, 0, 1 };
+
+        using (var attrs = new ImageAttributes())
+        using (var mid = new Bitmap(Math.Max(1, src.Width / 4), Math.Max(1, src.Height / 4)))
+        using (var tiny = new Bitmap(Math.Max(1, src.Width / 40), Math.Max(1, src.Height / 40)))
+        using (var soft = new Bitmap(Math.Max(1, src.Width / 4), Math.Max(1, src.Height / 4)))
+        {
+            attrs.SetColorMatrix(new ColorMatrix(m));
+            attrs.SetWrapMode(WrapMode.TileFlipXY); // evita bordes oscuros al escalar
+            using (var g = Graphics.FromImage(mid))
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                g.DrawImage(src, new Rectangle(0, 0, mid.Width, mid.Height), 0, 0, src.Width, src.Height, GraphicsUnit.Pixel, attrs);
+            }
+            using (var plain = new ImageAttributes())
+            {
+                plain.SetWrapMode(WrapMode.TileFlipXY);
+                using (var g = Graphics.FromImage(tiny))
+                {
+                    g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                    g.DrawImage(mid, new Rectangle(0, 0, tiny.Width, tiny.Height), 0, 0, mid.Width, mid.Height, GraphicsUnit.Pixel, plain);
+                }
+                // Se amplía en dos pasos: de golpe quedarían manchas cuadradas.
+                using (var g = Graphics.FromImage(soft))
+                {
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    g.DrawImage(tiny, new Rectangle(0, 0, soft.Width, soft.Height), 0, 0, tiny.Width, tiny.Height, GraphicsUnit.Pixel, plain);
+                }
+                var result = new Bitmap(src.Width, src.Height, PixelFormat.Format32bppArgb);
+                using (var g = Graphics.FromImage(result))
+                {
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    g.DrawImage(soft, new Rectangle(0, 0, result.Width, result.Height), 0, 0, soft.Width, soft.Height, GraphicsUnit.Pixel, plain);
+                }
+                return result;
+            }
+        }
+    }
+
+    // --- Dibujo --------------------------------------------------------------------------
+
     // Dibuja el menú en un bitmap ARGB y lo pasa a Windows con UpdateLayeredWindow,
-    // así cada píxel puede ser semitransparente (efecto "cristal").
+    // así cada píxel puede ser semitransparente.
     void Render()
     {
         if (!IsHandleCreated) return;
@@ -553,9 +799,30 @@ class RadialMenu : Form
             using (var g = Graphics.FromImage(bmp))
             {
                 g.Clear(Color.Transparent);
-                if (revealed) Draw(g);
-                // Alfa mínimo: casi invisible pero sigue recibiendo el arrastre.
-                else using (var b = new SolidBrush(Color.FromArgb(1, 255, 255, 255))) g.FillEllipse(b, pad, pad, outerR * 2, outerR * 2);
+                // Disco casi invisible a tamaño completo: mantiene el arrastre "enganchado" a la ventana
+                // aunque el menú visible esté a mitad de su animación de entrada.
+                using (var b = new SolidBrush(Color.FromArgb(1, 255, 255, 255)))
+                    g.FillEllipse(b, pad, pad, outerR * 2, outerR * 2);
+
+                if (revealed)
+                {
+                    float a = (float)Math.Max(0, Math.Min(1, appear.Value));
+                    using (var scene = new Bitmap(Width, Height, PixelFormat.Format32bppArgb))
+                    {
+                        using (var sg = Graphics.FromImage(scene)) Draw(sg);
+                        // Se materializa desde el cursor: escala + opacidad. Con animaciones desactivadas, solo fundido.
+                        float k = look.Motion ? 0.86f + 0.14f * a : 1f;
+                        g.TranslateTransform(center, center);
+                        g.ScaleTransform(k, k);
+                        g.TranslateTransform(-center, -center);
+                        g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                        using (var attrs = new ImageAttributes())
+                        {
+                            attrs.SetColorMatrix(new ColorMatrix { Matrix33 = a });
+                            g.DrawImage(scene, new Rectangle(0, 0, Width, Height), 0, 0, Width, Height, GraphicsUnit.Pixel, attrs);
+                        }
+                    }
+                }
             }
             Native.ApplyLayeredBitmap(this, bmp);
         }
@@ -565,100 +832,146 @@ class RadialMenu : Form
     {
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
 
         var outer = new RectangleF(pad, pad, outerR * 2, outerR * 2);
         var inner = new RectangleF(center - innerR, center - innerR, innerR * 2, innerR * 2);
 
-        // Sombra suave alrededor del anillo.
-        for (int i = pad; i > 0; i--)
+        // Sombra amplia y suave, algo desplazada hacia abajo: una superficie grande "flota" más.
+        int shadowSteps = pad - 2;
+        for (int i = shadowSteps; i > 0; i--)
         {
-            using (var pen = new Pen(Color.FromArgb((int)(28.0 * (pad - i + 1) / pad), 0, 0, 0), 1.5f))
-                g.DrawEllipse(pen, RectangleF.Inflate(outer, i - 1, i - 1 + 0.5f));
+            double t = 1 - (double)i / shadowSteps;
+            int alpha = (int)((look.Dark ? 70 : 38) * t * t / 6);
+            using (var b = new SolidBrush(Color.FromArgb(alpha, 0, 0, 0)))
+                g.FillEllipse(b, RectangleF.Inflate(new RectangleF(outer.X, outer.Y + 6 * scale, outer.Width, outer.Height), i, i));
         }
 
-        // Anillo translúcido.
-        using (var ring = new GraphicsPath())
+        // Material: fondo desenfocado + tinte translúcido.
+        using (var disk = new GraphicsPath())
         {
-            ring.AddEllipse(outer);
-            ring.AddEllipse(inner);
-            using (var glass = new LinearGradientBrush(outer, Color.FromArgb(150, 255, 250, 245), Color.FromArgb(150, 255, 196, 150), 70f))
-                g.FillPath(glass, ring);
+            disk.AddEllipse(outer);
+            var oldClip = g.Clip;
+            g.SetClip(disk);
+            if (backdrop != null) g.DrawImage(backdrop, 0, 0, Width, Height);
+            using (var tint = new SolidBrush(look.Tint)) g.FillPath(tint, disk);
+            g.Clip = oldClip;
         }
 
         int n = actions.Count;
         float sweep = n > 0 ? 360f / n : 360f;
-        using (var font = new FontFamily("Segoe UI"))
-        using (var sep = new Pen(Color.FromArgb(210, 255, 255, 255), 1.5f * scale))
+
+        // Separadores finos, sin llegar a los bordes.
+        if (n > 1)
+        {
+            using (var sep = new Pen(look.Separator, 1f * scale))
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    double a = (-90 - sweep / 2 + i * sweep) * Math.PI / 180;
+                    float r0 = innerR + 14 * scale, r1 = outerR - 14 * scale;
+                    g.DrawLine(sep, center + (float)Math.Cos(a) * r0, center + (float)Math.Sin(a) * r0,
+                                    center + (float)Math.Cos(a) * r1, center + (float)Math.Sin(a) * r1);
+                }
+            }
+        }
+
+        // Opción resaltada: una pieza sólida de color de acento, con esquinas redondeadas,
+        // que se adelanta un poco hacia el cursor.
+        for (int i = 0; i < n; i++)
+        {
+            float hv = (float)Math.Max(0, Math.Min(1, hovers[i].Value));
+            if (hv < 0.01f) continue;
+            float start = -90 - sweep / 2 + i * sweep;
+            double mid = (start + sweep / 2) * Math.PI / 180;
+            float push = 3 * scale * hv;
+            using (var path = SegmentPath(start, sweep, (float)Math.Cos(mid) * push, (float)Math.Sin(mid) * push))
+            {
+                Color c = i == pressed ? look.AccentPressed : look.Accent;
+                var fill = Color.FromArgb((int)(255 * hv), c);
+                using (var brush = new SolidBrush(fill)) g.FillPath(brush, path);
+                using (var round = new Pen(fill, 8 * scale) { LineJoin = LineJoin.Round }) g.DrawPath(round, path);
+            }
+        }
+
+        // Etiquetas.
+        float labelSize = (n > 8 ? 12.5f : 14f) * scale;
         using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
         {
             for (int i = 0; i < n; i++)
             {
+                float hv = (float)Math.Max(0, Math.Min(1, hovers[i].Value));
                 float start = -90 - sweep / 2 + i * sweep;
-                if (i == hover)
-                {
-                    using (var path = new GraphicsPath())
-                    using (var brush = new LinearGradientBrush(outer, Color.FromArgb(235, 255, 110, 50), Color.FromArgb(235, 226, 58, 22), 90f))
-                    {
-                        path.AddArc(outer, start, sweep);
-                        path.AddArc(inner, start + sweep, -sweep);
-                        path.CloseFigure();
-                        g.FillPath(brush, path);
-                    }
-                }
-                if (n > 1)
-                {
-                    double a = start * Math.PI / 180;
-                    g.DrawLine(sep, center + (float)Math.Cos(a) * innerR, center + (float)Math.Sin(a) * innerR,
-                                    center + (float)Math.Cos(a) * outerR, center + (float)Math.Sin(a) * outerR);
-                }
-
-                // Etiqueta centrada en la cuña.
                 double mid = (start + sweep / 2) * Math.PI / 180;
-                float r = (outerR + innerR) / 2f;
+                float r = (outerR + innerR) / 2f + 3 * scale * hv;
                 var c = new PointF(center + (float)Math.Cos(mid) * r, center + (float)Math.Sin(mid) * r);
-                bool active = i == hover;
-                DrawLabel(g, actions[i].Label, font, FontStyle.Bold, (n > 8 ? 12f : 14f) * scale, c,
-                    active ? Color.White : Color.FromArgb(70, 32, 12),
-                    active ? Color.FromArgb(90, 120, 30, 0) : Color.FromArgb(200, 255, 255, 255), sf);
+                using (var path = new GraphicsPath())
+                using (var brush = new SolidBrush(Lerp(look.Text, look.OnAccent, hv)))
+                {
+                    var box = new RectangleF(c.X - 60 * scale, c.Y - 16 * scale, 120 * scale, 32 * scale);
+                    path.AddString(actions[i].Label, labelFont, (int)FontStyle.Regular, labelSize, box, sf);
+                    g.FillPath(brush, path);
+                }
             }
         }
 
-        // Bordes del anillo.
-        using (var edge = new Pen(Color.FromArgb(230, 255, 255, 255), 1.5f * scale))
-        {
-            g.DrawEllipse(edge, outer);
-            g.DrawEllipse(edge, inner);
-        }
+        // Borde de luz: una línea clara donde el cristal "atrapa" la luz.
+        using (var edge = new Pen(look.Edge, 1f * scale)) g.DrawEllipse(edge, RectangleF.Inflate(outer, -0.5f * scale, -0.5f * scale));
 
-        // Centro: nombre del archivo o descripción de la opción señalada.
-        using (var cb = new SolidBrush(Color.FromArgb(235, 255, 252, 248)))
-            g.FillEllipse(cb, inner);
+        // Centro: superficie más opaca con la jerarquía de texto (principal + secundario).
+        using (var cb = new SolidBrush(look.Center)) g.FillEllipse(cb, inner);
+        using (var edge = new Pen(look.Separator, 1f * scale)) g.DrawEllipse(edge, inner);
 
-        string caption;
-        if (n == 0) caption = "Switchify";
-        else if (hover >= 0) caption = actions[hover].Description;
-        else caption = files.Count == 1 ? Shorten(Path.GetFileName(files[0])) : files.Count + " archivos";
-        using (var tb = new SolidBrush(Color.FromArgb(70, 32, 12)))
-        using (var font = new Font("Segoe UI Semibold", 11.5f * scale, GraphicsUnit.Pixel))
-        using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+        string name = files.Count == 1 ? Shorten(Path.GetFileName(files[0])) : files.Count + " archivos";
+        string primary, secondary;
+        if (n == 0) { primary = "Switchify"; secondary = ""; }
+        else if (hover >= 0) { primary = actions[hover].Description; secondary = name; }
+        else { primary = name; secondary = dragMode ? "Suelta en una opción" : "Elige una opción"; }
+
+        var textBox = RectangleF.Inflate(inner, -12 * scale, -14 * scale);
+        using (var f1 = new Font(labelFont, 12.5f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+        using (var f2 = new Font(textFont, 11f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+        using (var b1 = new SolidBrush(look.Text))
+        using (var b2 = new SolidBrush(look.Secondary))
+        using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Far, Trimming = StringTrimming.EllipsisCharacter })
+        using (var sf2 = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Near, Trimming = StringTrimming.EllipsisCharacter })
         {
-            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
-            g.DrawString(caption, font, tb, RectangleF.Inflate(inner, -10 * scale, -10 * scale), sf);
+            float gap = 2 * scale;
+            var top = new RectangleF(textBox.X, textBox.Y, textBox.Width, textBox.Height / 2 + 6 * scale - gap);
+            var bottom = new RectangleF(textBox.X, textBox.Y + textBox.Height / 2 + 6 * scale + gap, textBox.Width, textBox.Height / 2 - 6 * scale);
+            if (secondary.Length == 0) top = textBox;
+            g.DrawString(primary, f1, b1, top, secondary.Length == 0 ? new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center } : sf);
+            if (secondary.Length > 0) g.DrawString(secondary, f2, b2, bottom, sf2);
         }
     }
 
-    // Texto como trazado con un halo alrededor: se lee bien sobre cualquier fondo.
-    static void DrawLabel(Graphics g, string text, FontFamily family, FontStyle style, float size, PointF c,
-                          Color fill, Color halo, StringFormat sf)
+    // Pieza del anillo, recortada hacia dentro para que el trazo redondeado no se salga del borde.
+    GraphicsPath SegmentPath(float start, float sweep, float dx, float dy)
     {
-        using (var path = new GraphicsPath())
+        float inset = 9 * scale;
+        var o = new RectangleF(pad + inset + dx, pad + inset + dy, (outerR - inset) * 2, (outerR - inset) * 2);
+        var ir = innerR + inset;
+        var i = new RectangleF(center - ir + dx, center - ir + dy, ir * 2, ir * 2);
+        float angOuter = (float)(inset / (outerR - inset) * 180 / Math.PI);
+        float angInner = (float)(inset / ir * 180 / Math.PI);
+        var path = new GraphicsPath();
+        if (sweep >= 359)
         {
-            path.AddString(text, family, (int)style, size, new RectangleF(c.X - 60 * size / 14, c.Y - 16 * size / 14, 120 * size / 14, 32 * size / 14), sf);
-            using (var pen = new Pen(halo, size / 3.5f) { LineJoin = LineJoin.Round })
-                g.DrawPath(pen, path);
-            using (var brush = new SolidBrush(fill))
-                g.FillPath(brush, path);
+            path.AddEllipse(o);
+            path.AddEllipse(i);
+            return path;
         }
+        path.AddArc(o, start + angOuter, sweep - 2 * angOuter);
+        path.AddArc(i, start + sweep - angInner, -(sweep - 2 * angInner));
+        path.CloseFigure();
+        return path;
+    }
+
+    static Color Lerp(Color a, Color b, float t)
+    {
+        return Color.FromArgb(
+            (int)(a.A + (b.A - a.A) * t), (int)(a.R + (b.R - a.R) * t),
+            (int)(a.G + (b.G - a.G) * t), (int)(a.B + (b.B - a.B) * t));
     }
 
     static string Shorten(string name)
