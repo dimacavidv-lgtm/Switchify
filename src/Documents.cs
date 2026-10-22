@@ -982,6 +982,12 @@ static class WinRt
         op.GetResults();
     }
 
+    public static void Wait<TProgress>(IAsyncActionWithProgress<TProgress> op)
+    {
+        Block(op);
+        op.GetResults();
+    }
+
     static void Block(IAsyncInfo op)
     {
         while (op.Status == AsyncStatus.Started) Thread.Sleep(5);

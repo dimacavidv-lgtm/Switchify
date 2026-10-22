@@ -121,6 +121,9 @@ class TrayContext : ApplicationContext
         menu = new RadialMenu();
         menu.ActionFinished += ShowResult;
         EditorForm.Notify = ShowResult;
+        // Progreso de vídeo/audio en el texto del icono de la bandeja (llega desde otro hilo).
+        MediaOps.Progress = text => menu.BeginInvoke(new Action(() =>
+            tray.Text = text == null ? "Switchify – arrastra + Shift o Ctrl+Shift+Espacio" : "Switchify – " + text));
         var forceHandle = menu.Handle; // necesario para BeginInvoke desde el hook
 
         var startup = new ToolStripMenuItem("Iniciar con Windows") { Checked = IsStartupEnabled() };
@@ -796,6 +799,8 @@ class RadialMenu : Form
             }));
             return;
         }
+        if (action.Slow && ActionFinished != null)
+            ActionFinished(action.Description + "…", "Te aviso cuando termine. El progreso se ve en el icono de la bandeja.", false);
         Task.Factory.StartNew(() =>
         {
             var outputs = new List<string>();
@@ -1286,6 +1291,7 @@ class FileAction
     public Action<string> Open;                    // abre una ventana de herramienta (hilo de la interfaz)
     public List<FileAction> SubActions;            // otra página del anillo
     public string Icon;                            // símbolo dibujado sobre la etiqueta (ver Icons)
+    public bool Slow;                              // tarda (vídeo, audio): se avisa al empezar
     public bool Batch { get { return RunBatch != null; } }
 }
 
@@ -1367,6 +1373,18 @@ static class FileActions
         new[] { "GIF", ".gif" }, new[] { "TIFF", ".tiff" }, new[] { "ICO", ".ico" }
     };
 
+    static readonly string[][] AudioFormats =
+    {
+        new[] { "MP3", ".mp3" }, new[] { "M4A", ".m4a" }, new[] { "WAV", ".wav" },
+        new[] { "FLAC", ".flac" }, new[] { "WMA", ".wma" }
+    };
+
+    // Las conversiones de vídeo y audio pueden tardar: se marcan como lentas para avisar al empezar.
+    static FileAction Media(string label, string description, string ext, bool compress)
+    {
+        return new FileAction { Label = label, Description = description, Slow = true, Run = f => MediaOps.Convert(f, ext, compress) };
+    }
+
     static readonly string[][] DocFormats =
     {
         new[] { "PDF", ".pdf" }, new[] { "DOCX", ".docx" }, new[] { "MD", ".md" },
@@ -1417,6 +1435,26 @@ static class FileActions
             }
             list.Add(new FileAction { Label = "PDF", Description = files.Count == 1 ? "Convertir a PDF" : "Unir en un PDF", RunBatch = PdfWriter.FromImages });
             list.Add(new FileAction { Label = "Texto", Description = "Extraer texto (OCR)", Run = Documents.ImageToText });
+        }
+        else if (files.All(MediaOps.IsVideo))
+        {
+            string own = files.Select(f => Path.GetExtension(f).ToLowerInvariant()).Distinct().Count() == 1
+                ? Path.GetExtension(files[0]).ToLowerInvariant() : null;
+            if (own != ".mp4") list.Add(Media("MP4", "Convertir a MP4", ".mp4", false));
+            if (own != ".wmv") list.Add(Media("WMV", "Convertir a WMV", ".wmv", false));
+            list.Add(Media("Comprimir", "Vídeo más ligero (MP4)", ".mp4", true));
+            list.Add(Media("MP3", "Extraer audio a MP3", ".mp3", false));
+            list.Add(Media("M4A", "Extraer audio a M4A", ".m4a", false));
+            list.Add(Media("WAV", "Extraer audio a WAV", ".wav", false));
+        }
+        else if (files.All(MediaOps.IsAudio))
+        {
+            var exts = files.Select(f => Path.GetExtension(f).ToLowerInvariant()).Distinct().ToList();
+            foreach (var fmt in AudioFormats)
+            {
+                if (exts.Count == 1 && exts[0] == fmt[1]) continue;
+                list.Add(Media(fmt[0], "Convertir a " + fmt[0], fmt[1], false));
+            }
         }
         else if (files.All(f => File.Exists(f) && Path.GetExtension(f).ToLowerInvariant() == ".pdf"))
         {
