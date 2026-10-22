@@ -399,21 +399,30 @@ abstract class EditorForm : Form
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
     [DllImport("gdi32.dll")] static extern bool BitBlt(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, int rop);
     [DllImport("user32.dll")] static extern bool SetWindowDisplayAffinity(IntPtr hwnd, int affinity);
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hwnd, IntPtr hdc);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleBitmap(IntPtr hdc, int w, int h);
+    [DllImport("gdi32.dll")] static extern int SetStretchBltMode(IntPtr hdc, int mode);
+    [DllImport("gdi32.dll")] static extern bool StretchBlt(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, int sw, int sh, int rop);
     [DllImport("dwmapi.dll")] static extern int DwmFlush();
     [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr hdc);
     [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr hdc, IntPtr obj);
     [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
     [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr hdc);
 
-    // Barra de título propia, al estilo macOS: cerrar, minimizar y maximizar a la izquierda.
+    // Barra de título propia con los botones de colores de macOS (a la derecha, como en Windows).
     static readonly Color[] LightColors = { Color.FromArgb(255, 95, 87), Color.FromArgb(254, 188, 46), Color.FromArgb(40, 200, 64) };
     readonly float titleHeight;
     int hoverLight = -1, pressedLight = -1;
-    Bitmap buffer;
-    Bitmap backdrop;            // lo que hay detrás de la ventana, desenfocado (para el esmerilado)
+    Bitmap buffer;              // imagen final que se entrega a Windows (cristal + contenido)
+    Bitmap content;             // todo lo que no es el cristal, ya dibujado; solo se rehace si cambia algo
+    bool contentDirty = true;
+    Bitmap screenBlur;          // la pantalla entera (sin esta ventana), desenfocada y a tamaño real
+    Bitmap screenBlurSmall;     // lo mismo a 1/4 de tamaño (se tiene al instante; el grande se hace en segundo plano)
+    Rectangle screenBlurBounds;
+    int captureVersion;
+    readonly System.Diagnostics.Stopwatch screenAge = new System.Diagnostics.Stopwatch();
     bool renderQueued;
-    readonly System.Windows.Forms.Timer moveTimer;
-    readonly System.Diagnostics.Stopwatch moveClock = System.Diagnostics.Stopwatch.StartNew();
     readonly Size intendedSize;
 
     protected readonly string SourcePath;
@@ -454,54 +463,211 @@ abstract class EditorForm : Form
         DoubleBuffered = false;
 
         // Cristal: se mira lo que hay detrás antes de mostrar la ventana para elegir texto claro u oscuro.
-        moveTimer = new System.Windows.Forms.Timer { Interval = 140 };
-        moveTimer.Tick += delegate { moveTimer.Stop(); RefreshBackdrop(); Render(); };
-        if (T.Glass) RefreshBackdrop();
+        if (T.Glass) CaptureScreen();
     }
 
-    // Captura lo que hay detrás (las ventanas en capas, como esta, no salen en la captura),
-    // decide el color del texto según su luminosidad y guarda una copia desenfocada para el esmerilado.
-    void RefreshBackdrop()
+    // Captura la pantalla en la que está la ventana y la desenfoca una sola vez. Mover la ventana después
+    // solo recorta el trozo que le toca de esa imagen (capturar y desenfocar en cada movimiento la hacía lenta).
+    void CaptureScreen()
     {
         if (!T.Glass) return;
         try
         {
-            var r = Bounds;
-            using (var shot = new Bitmap(r.Width, r.Height, PixelFormat.Format32bppArgb))
+            var screen = Screen.FromRectangle(Bounds).Bounds;
+            // La captura incluiría la propia ventana y sus colores se irían colando en el cristal.
+            // Se excluye solo durante este instante, esperando a que Windows componga un fotograma sin ella.
+            bool exclude = IsHandleCreated && Visible;
+            Bitmap shot;
+            if (exclude) { SetWindowDisplayAffinity(Handle, 0x11); DwmFlush(); }   // WDA_EXCLUDEFROMCAPTURE
+            try { shot = CaptureReduced(screen, BlurScale); }
+            finally
             {
-                // La captura incluiría la propia ventana y sus colores se irían colando en el cristal cada vez
-                // que se rehace (al moverla cambiaba de color). Se excluye de la captura solo durante este
-                // instante, esperando a que Windows componga un fotograma sin ella.
-                bool exclude = IsHandleCreated && Visible;
-                if (exclude) { SetWindowDisplayAffinity(Handle, 0x11); DwmFlush(); }   // WDA_EXCLUDEFROMCAPTURE
-                try
-                {
-                    using (var g = Graphics.FromImage(shot)) g.CopyFromScreen(r.Location, Point.Empty, r.Size);
-                }
-                finally
-                {
-                    if (exclude) SetWindowDisplayAffinity(Handle, 0);                     // WDA_NONE
-                }
-                T.UseGlass(Luminance(shot));
-                if (backdrop != null) backdrop.Dispose();
-                backdrop = RadialMenu.Blur(shot);
+                if (exclude) SetWindowDisplayAffinity(Handle, 0);                     // WDA_NONE
             }
+            using (shot)
+            {
+                if (screenBlurSmall != null) screenBlurSmall.Dispose();
+                screenBlurSmall = BlurSmall(shot);
+            }
+            // Si cambia de pantalla, el desenfoque ampliado de la otra ya no sirve.
+            if (screen != screenBlurBounds && screenBlur != null) { screenBlur.Dispose(); screenBlur = null; }
+            screenBlurBounds = screen;
+            screenAge.Restart();
+
+            // Ampliarlo a tamaño de pantalla (para que mover la ventana sea solo copiar un trozo) cuesta
+            // ~150 ms: se hace en segundo plano. Mientras, se sigue usando el anterior o el pequeño.
+            // Se hace con aritmética propia sobre los píxeles: GDI+ comparte un bloqueo entre hilos y ampliar
+            // con él en segundo plano frenaba también el dibujo de la ventana.
+            int version = ++captureVersion;
+            int sw = screenBlurSmall.Width, sh = screenBlurSmall.Height;
+            var pixels = ReadPixels(screenBlurSmall);
+            var size = screen.Size;
+            System.Threading.Tasks.Task.Factory.StartNew(() =>
+            {
+                var full = UpscaleBilinear(pixels, sw, sh, size.Width, size.Height);
+                var bmp = new Bitmap(size.Width, size.Height, PixelFormat.Format32bppPArgb);
+                WritePixels(bmp, full);
+                return bmp;
+            }).ContinueWith(task =>
+            {
+                if (IsDisposed || version != captureVersion || task.IsFaulted) { if (!task.IsFaulted) task.Result.Dispose(); return; }
+                if (screenBlur != null) screenBlur.Dispose();
+                screenBlur = task.Result;
+                Render();
+            }, System.Threading.Tasks.TaskScheduler.FromCurrentSynchronizationContext());
         }
-        catch { T.UseGlass(0.5); }
+        catch
+        {
+            if (screenBlurSmall != null) { screenBlurSmall.Dispose(); screenBlurSmall = null; }
+        }
+        UpdateLuminance();
     }
 
-    static double Luminance(Bitmap bmp)
+    // La pantalla se captura y desenfoca a 1/4 de su tamaño: es borrosa de todos modos y así es mucho más barato.
+    const int BlurScale = 4;
+
+    static int[] ReadPixels(Bitmap bmp)
     {
-        double sum = 0;
-        int count = 0, step = Math.Max(8, Math.Min(bmp.Width, bmp.Height) / 24);
-        for (int y = step / 2; y < bmp.Height; y += step)
-            for (int x = step / 2; x < bmp.Width; x += step)
+        var data = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
+        try
+        {
+            var px = new int[bmp.Width * bmp.Height];
+            for (int y = 0; y < bmp.Height; y++)
+                Marshal.Copy(data.Scan0 + y * data.Stride, px, y * bmp.Width, bmp.Width);
+            return px;
+        }
+        finally { bmp.UnlockBits(data); }
+    }
+
+    static void WritePixels(Bitmap bmp, int[] px)
+    {
+        var data = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height), ImageLockMode.WriteOnly, PixelFormat.Format32bppPArgb);
+        try
+        {
+            for (int y = 0; y < bmp.Height; y++)
+                Marshal.Copy(px, y * bmp.Width, data.Scan0 + y * data.Stride, bmp.Width);
+        }
+        finally { bmp.UnlockBits(data); }
+    }
+
+    // Ampliación bilineal en punto fijo (8 bits de fracción) sobre píxeles BGRA.
+    static int[] UpscaleBilinear(int[] src, int sw, int sh, int dw, int dh)
+    {
+        var dst = new int[dw * dh];
+        var x0 = new int[dw]; var x1 = new int[dw]; var fx = new int[dw];
+        for (int x = 0; x < dw; x++)
+        {
+            double sx = Math.Max(0, (x + 0.5) * sw / dw - 0.5);
+            x0[x] = Math.Min(sw - 1, (int)sx);
+            x1[x] = Math.Min(sw - 1, x0[x] + 1);
+            fx[x] = (int)((sx - x0[x]) * 256);
+        }
+        for (int y = 0; y < dh; y++)
+        {
+            double sy = Math.Max(0, (y + 0.5) * sh / dh - 0.5);
+            int y0 = Math.Min(sh - 1, (int)sy), y1 = Math.Min(sh - 1, y0 + 1);
+            int fy = (int)((sy - y0) * 256);
+            int r0 = y0 * sw, r1 = y1 * sw, o = y * dw;
+            for (int x = 0; x < dw; x++)
             {
-                var c = bmp.GetPixel(x, y);
-                sum += (0.2126 * c.R + 0.7152 * c.G + 0.0722 * c.B) / 255;
-                count++;
+                int a = src[r0 + x0[x]], b = src[r0 + x1[x]], c = src[r1 + x0[x]], d = src[r1 + x1[x]];
+                int wx = fx[x], result = 0;
+                for (int shift = 0; shift < 32; shift += 8)
+                {
+                    int ca = (a >> shift) & 255, cb = (b >> shift) & 255, cc = (c >> shift) & 255, cd = (d >> shift) & 255;
+                    int top = ca * 256 + (cb - ca) * wx, bottom = cc * 256 + (cd - cc) * wx;
+                    int v = (top * 256 + (bottom - top) * fy) >> 16;
+                    result |= (v & 255) << shift;
+                }
+                dst[o + x] = result;
             }
-        return count == 0 ? 0.5 : sum / count;
+        }
+        return dst;
+    }
+
+    // Copia la pantalla ya reducida: Windows promedia los píxeles al copiar (HALFTONE), sin pasar por
+    // una copia a tamaño completo.
+    static Bitmap CaptureReduced(Rectangle screen, int factor)
+    {
+        int w = Math.Max(1, screen.Width / factor), h = Math.Max(1, screen.Height / factor);
+        IntPtr screenDc = GetDC(IntPtr.Zero);
+        IntPtr mem = CreateCompatibleDC(screenDc);
+        IntPtr hbmp = CreateCompatibleBitmap(screenDc, w, h);
+        IntPtr old = SelectObject(mem, hbmp);
+        try
+        {
+            SetStretchBltMode(mem, 4);   // HALFTONE
+            StretchBlt(mem, 0, 0, w, h, screenDc, screen.X, screen.Y, screen.Width, screen.Height, 0x00CC0020);
+            SelectObject(mem, old);
+            return Image.FromHbitmap(hbmp);
+        }
+        finally
+        {
+            DeleteObject(hbmp);
+            DeleteDC(mem);
+            ReleaseDC(IntPtr.Zero, screenDc);
+        }
+    }
+
+    // Desenfoque fuerte y algo de saturación (como el cristal del menú), sin salir del tamaño reducido.
+    static Bitmap BlurSmall(Bitmap src)
+    {
+        const float s = 1.6f;
+        float[] lum = { 0.2126f, 0.7152f, 0.0722f };
+        var m = new float[5][];
+        for (int r = 0; r < 3; r++)
+        {
+            m[r] = new float[5];
+            for (int c = 0; c < 3; c++) m[r][c] = (1 - s) * lum[r] + (r == c ? s : 0);
+        }
+        m[3] = new float[] { 0, 0, 0, 1, 0 };
+        m[4] = new float[] { 0, 0, 0, 0, 1 };
+
+        using (var tiny = new Bitmap(Math.Max(1, src.Width / 10), Math.Max(1, src.Height / 10)))
+        using (var attrs = new ImageAttributes())
+        {
+            attrs.SetColorMatrix(new ColorMatrix(m));
+            attrs.SetWrapMode(WrapMode.TileFlipXY);   // evita bordes oscuros al escalar
+            using (var g = Graphics.FromImage(tiny))
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                g.DrawImage(src, new Rectangle(0, 0, tiny.Width, tiny.Height), 0, 0, src.Width, src.Height, GraphicsUnit.Pixel, attrs);
+            }
+            var result = new Bitmap(src.Width, src.Height, PixelFormat.Format32bppPArgb);
+            using (var plain = new ImageAttributes())
+            using (var g = Graphics.FromImage(result))
+            {
+                plain.SetWrapMode(WrapMode.TileFlipXY);
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.DrawImage(tiny, new Rectangle(0, 0, result.Width, result.Height), 0, 0, tiny.Width, tiny.Height, GraphicsUnit.Pixel, plain);
+            }
+            return result;
+        }
+    }
+
+    // Texto claro u oscuro según lo que hay detrás de la ventana (se mira en la captura ya hecha).
+    void UpdateLuminance()
+    {
+        bool before = T.LightText;
+        double sum = 0;
+        int count = 0;
+        if (screenBlurSmall != null)
+        {
+            var r = Rectangle.Intersect(Bounds, screenBlurBounds);
+            int step = Math.Max(8, Math.Min(r.Width, r.Height) / 24);
+            for (int y = r.Top + step / 2; y < r.Bottom; y += step)
+                for (int x = r.Left + step / 2; x < r.Right; x += step)
+                {
+                    int sx = Math.Min(screenBlurSmall.Width - 1, (x - screenBlurBounds.X) / BlurScale);
+                    int sy = Math.Min(screenBlurSmall.Height - 1, (y - screenBlurBounds.Y) / BlurScale);
+                    var c = screenBlurSmall.GetPixel(sx, sy);
+                    sum += (0.2126 * c.R + 0.7152 * c.G + 0.0722 * c.B) / 255;
+                    count++;
+                }
+        }
+        T.UseGlass(count == 0 ? 0.5 : sum / count);
+        if (T.LightText != before) contentDirty = true;
     }
 
     protected override CreateParams CreateParams
@@ -527,10 +693,14 @@ abstract class EditorForm : Form
 
     // --- Barra de título propia -------------------------------------------------------------
 
+    // A la derecha y en el orden de Windows (minimizar, maximizar, cerrar), con cerrar en el extremo.
+    // `i`: 0 = cerrar, 1 = minimizar, 2 = maximizar.
     RectangleF LightRect(int i)
     {
-        float d = 12 * S, gap = 8 * S;
-        return new RectangleF(16 * S + i * (d + gap), (titleHeight - d) / 2, d, d);
+        float d = 15 * S, gap = 9 * S;
+        int slot = i == 1 ? 0 : i == 2 ? 1 : 2;
+        float x = ClientSize.Width - 18 * S - 3 * d - 2 * gap + slot * (d + gap);
+        return new RectangleF(x, (titleHeight - d) / 2, d, d);
     }
 
     int LightAt(Point p)
@@ -553,7 +723,7 @@ abstract class EditorForm : Form
             // Los símbolos aparecen al pasar por encima, como en macOS.
             using (var p = new Pen(Color.FromArgb(150, 0, 0, 0), 1.3f * S) { StartCap = LineCap.Round, EndCap = LineCap.Round })
             {
-                float cx = r.X + r.Width / 2, cy = r.Y + r.Height / 2, k = 2.8f * S;
+                float cx = r.X + r.Width / 2, cy = r.Y + r.Height / 2, k = 3.4f * S;
                 if (i == 0) { g.DrawLine(p, cx - k, cy - k, cx + k, cy + k); g.DrawLine(p, cx - k, cy + k, cx + k, cy - k); }
                 else if (i == 1) g.DrawLine(p, cx - k, cy, cx + k, cy);
                 else { g.DrawLine(p, cx - k, cy, cx + k, cy); g.DrawLine(p, cx, cy - k, cx, cy + k); }
@@ -561,7 +731,7 @@ abstract class EditorForm : Form
         }
         using (var f = T.Font(13f, true))
         using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
-            T.DrawText(g, Text, f, new RectangleF(100 * S, 0, ClientSize.Width - 200 * S, titleHeight), sf, T.Text, true);
+            T.DrawText(g, Text, f, new RectangleF(120 * S, 0, ClientSize.Width - 240 * S, titleHeight), sf, T.Text, true);
     }
 
     void PressLight(int i)
@@ -574,7 +744,9 @@ abstract class EditorForm : Form
     // Arrastrar desde la barra y redimensionar desde los bordes, ya que la ventana no tiene marco de Windows.
     protected override void WndProc(ref Message m)
     {
-        const int WM_NCHITTEST = 0x84;
+        const int WM_NCHITTEST = 0x84, WM_ENTERSIZEMOVE = 0x231, WM_EXITSIZEMOVE = 0x232;
+        if (m.Msg == WM_ENTERSIZEMOVE) OnMoveSizeStart();
+        else if (m.Msg == WM_EXITSIZEMOVE) OnMoveSizeEnd();
         if (m.Msg == WM_NCHITTEST)
         {
             int lp = m.LParam.ToInt32();
@@ -617,7 +789,7 @@ abstract class EditorForm : Form
             ClientSize = intendedSize;
             var area = Screen.FromPoint(Cursor.Position).WorkingArea;
             Location = new Point(area.X + (area.Width - Width) / 2, area.Y + (area.Height - Height) / 2);
-            RefreshBackdrop();
+            if (T.Glass) UpdateLuminance();
         }
         PerformLayout();
         Render();   // una ventana en capas no se ve hasta que se le da su primera imagen
@@ -642,7 +814,7 @@ abstract class EditorForm : Form
     protected override void OnPaint(PaintEventArgs e)
     {
         if (T.Glass) { Render(); return; }
-        if (!DrawBuffer()) return;
+        if (!Compose()) return;
         // Sin cristal: el búfer se copia a la ventana como siempre.
         IntPtr hbmp = buffer.GetHbitmap(Color.FromArgb(0));
         IntPtr mem = CreateCompatibleDC(IntPtr.Zero);
@@ -658,11 +830,12 @@ abstract class EditorForm : Form
         }
     }
 
-    // Una ventana en capas no recibe WM_PAINT útil: cada Invalidate() programa un redibujado
-    // (agrupado, para no repetirlo varias veces por movimiento del ratón).
+    // Cualquier Invalidate() significa que el contenido cambió. En una ventana en capas además hay que
+    // volver a entregarle la imagen (agrupado, para no repetirlo varias veces por movimiento del ratón).
     protected override void OnInvalidated(InvalidateEventArgs e)
     {
         base.OnInvalidated(e);
+        contentDirty = true;
         if (!T.Glass || renderQueued || !IsHandleCreated) return;
         renderQueued = true;
         BeginInvoke(new Action(() => { renderQueued = false; Render(); }));
@@ -671,87 +844,134 @@ abstract class EditorForm : Form
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
-        if (T.Glass && IsHandleCreated && WindowState != FormWindowState.Minimized) { RefreshBackdrop(); Render(); }
+        contentDirty = true;
+        if (T.Glass && IsHandleCreated && WindowState != FormWindowState.Minimized) Render();
     }
 
     protected override void OnMove(EventArgs e)
     {
         base.OnMove(e);
-        // Al terminar de mover la ventana se vuelve a mirar qué hay detrás.
-        // (moveTimer aún no existe mientras el constructor coloca la ventana.)
-        if (!T.Glass || moveTimer == null) return;
-        // Mientras se arrastra, el desenfoque se rehace como mucho cada 50 ms para que el fondo acompañe
-        // a la ventana; al soltarla, una última vez.
-        if (IsHandleCreated && moveClock.ElapsedMilliseconds > 50)
-        {
-            moveClock.Restart();
-            RefreshBackdrop();
-            Render();
-        }
-        moveTimer.Stop();
-        moveTimer.Start();
+        // Mover solo vuelve a combinar el trozo de cristal que toca con el contenido ya dibujado.
+        if (T.Glass && IsHandleCreated) Render();
+    }
+
+    protected override void OnActivated(EventArgs e)
+    {
+        base.OnActivated(e);
+        // Al volver a la ventana, lo de detrás puede haber cambiado: se captura de nuevo (si no es reciente).
+        if (T.Glass && IsHandleCreated && screenAge.ElapsedMilliseconds > 1500) { CaptureScreen(); Render(); }
+    }
+
+    // Inicio y fin de un arrastre (o de un cambio de tamaño) con el ratón.
+    void OnMoveSizeStart()
+    {
+        if (T.Glass && screenAge.ElapsedMilliseconds > 1500) CaptureScreen();
+    }
+
+    void OnMoveSizeEnd()
+    {
+        if (!T.Glass) return;
+        // Si la ventana ha pasado a otra pantalla, se captura esa; si no, basta con mirar el nuevo fondo.
+        if (!screenBlurBounds.Contains(Bounds)) CaptureScreen();
+        else UpdateLuminance();
+        Render();
     }
 
     void Render()
     {
         if (!T.Glass || !IsHandleCreated || WindowState == FormWindowState.Minimized) return;
-        if (DrawBuffer()) Native.ApplyLayeredBitmap(this, buffer);
+        if (Compose()) Native.ApplyLayeredBitmap(this, buffer);
     }
 
-    bool DrawBuffer()
+    // Une el cristal (trozo de la pantalla desenfocada + tinte) con el contenido ya dibujado.
+    bool Compose()
     {
-        if (ClientSize.Width < 1 || ClientSize.Height < 1 || Widgets.Count == 0) return false;
+        if (!DrawContent()) return false;
         if (buffer == null || buffer.Size != ClientSize)
         {
             if (buffer != null) buffer.Dispose();
             buffer = new Bitmap(ClientSize.Width, ClientSize.Height, PixelFormat.Format32bppPArgb);
         }
-
         using (var g = Graphics.FromImage(buffer))
         {
+            if (!T.Glass)
+            {
+                g.Clear(T.Window);
+            }
+            else
+            {
+                g.Clear(Color.Transparent);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                using (var shape = WindowShape())
+                {
+                    g.SetClip(shape);
+                    if (screenBlur != null)
+                    {
+                        // El trozo de pantalla desenfocada que queda detrás de la ventana (copia 1:1).
+                        var src = new Rectangle(Left - screenBlurBounds.X, Top - screenBlurBounds.Y, buffer.Width, buffer.Height);
+                        g.DrawImage(screenBlur, new Rectangle(0, 0, buffer.Width, buffer.Height), src, GraphicsUnit.Pixel);
+                    }
+                    else if (screenBlurSmall != null)
+                    {
+                        // Aún no está la versión grande (se hace en segundo plano): se amplía el trozo pequeño.
+                        var src = new RectangleF((Left - screenBlurBounds.X) / (float)BlurScale, (Top - screenBlurBounds.Y) / (float)BlurScale,
+                                                 buffer.Width / (float)BlurScale, buffer.Height / (float)BlurScale);
+                        g.InterpolationMode = InterpolationMode.Bilinear;
+                        g.DrawImage(screenBlurSmall, new RectangleF(0, 0, buffer.Width, buffer.Height), src, GraphicsUnit.Pixel);
+                    }
+                    using (var b = new SolidBrush(T.Window)) g.FillPath(b, shape);
+                    g.ResetClip();
+                }
+            }
+            g.DrawImageUnscaled(content, 0, 0);
+        }
+        return true;
+    }
+
+    GraphicsPath WindowShape()
+    {
+        var whole = new RectangleF(0, 0, ClientSize.Width, ClientSize.Height);
+        float radius = T.Glass && WindowState == FormWindowState.Normal ? 12 * S : 0;
+        return Shapes.Rounded(RectangleF.Inflate(whole, -0.5f, -0.5f), radius);
+    }
+
+    // Título, vista previa y controles sobre fondo transparente. Solo se redibuja si algo cambió.
+    bool DrawContent()
+    {
+        if (ClientSize.Width < 1 || ClientSize.Height < 1 || Widgets.Count == 0) return false;
+        if (content == null || content.Size != ClientSize)
+        {
+            if (content != null) content.Dispose();
+            content = new Bitmap(ClientSize.Width, ClientSize.Height, PixelFormat.Format32bppPArgb);
+            contentDirty = true;
+        }
+        if (!contentDirty) return true;
+        contentDirty = false;
+
+        using (var g = Graphics.FromImage(content))
+        {
+            g.Clear(Color.Transparent);
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
             g.InterpolationMode = InterpolationMode.HighQualityBicubic;
             // ClearType no sirve sobre fondo transparente (deja bordes de color); suavizado normal.
-            g.TextRenderingHint = T.Glass ? System.Drawing.Text.TextRenderingHint.AntiAliasGridFit : System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
 
-            var whole = new RectangleF(0, 0, ClientSize.Width, ClientSize.Height);
-            bool rounded = T.Glass && WindowState == FormWindowState.Normal;
-            float radius = rounded ? 12 * S : 0;
-            using (var shape = Shapes.Rounded(RectangleF.Inflate(whole, -0.5f, -0.5f), radius))
-            {
-                if (T.Glass)
-                {
-                    // Cristal: esquinas redondeadas propias, esmerilado al 15 % y tinte ligero.
-                    g.Clear(Color.Transparent);
-                    g.SetClip(shape);
-                    if (backdrop != null)
-                    {
-                        using (var attrs = new ImageAttributes())
-                        {
-                            attrs.SetColorMatrix(new ColorMatrix { Matrix33 = EditorTheme.Frost });
-                            g.DrawImage(backdrop, new Rectangle(0, 0, buffer.Width, buffer.Height), 0, 0, backdrop.Width, backdrop.Height, GraphicsUnit.Pixel, attrs);
-                        }
-                    }
-                    using (var b = new SolidBrush(T.Window)) g.FillPath(b, shape);
-                }
-                else g.Clear(T.Window);
+            DrawTitleBar(g);
+            using (var path = Shapes.Rounded(PreviewArea, 12 * S))
+            using (var b = new SolidBrush(T.Canvas))
+                g.FillPath(b, path);
+            var clip = g.Clip;
+            using (var path = Shapes.Rounded(PreviewArea, 12 * S)) g.SetClip(path, CombineMode.Intersect);
+            DrawPreview(g);
+            g.Clip = clip;
 
-                DrawTitleBar(g);
-                using (var path = Shapes.Rounded(PreviewArea, 12 * S))
-                using (var b = new SolidBrush(T.Canvas))
-                    g.FillPath(b, path);
-                var clip = g.Clip;
-                using (var path = Shapes.Rounded(PreviewArea, 12 * S)) g.SetClip(path, CombineMode.Intersect);
-                DrawPreview(g);
-                g.Clip = clip;
+            foreach (var w in Widgets.Where(w => w.Visible)) w.Draw(g, T);
+            g.ResetClip();
 
-                foreach (var w in Widgets.Where(w => w.Visible)) w.Draw(g, T);
-                g.ResetClip();
-
-                // Borde fino de luz alrededor de la ventana.
-                using (var p = new Pen(T.Separator, 1)) g.DrawPath(p, shape);
-            }
+            // Borde fino de luz alrededor de la ventana.
+            using (var shape = WindowShape())
+            using (var p = new Pen(T.Separator, 1)) g.DrawPath(p, shape);
         }
         return true;
     }
@@ -849,7 +1069,7 @@ abstract class EditorForm : Form
     {
         base.OnMouseMove(e);
         int light = LightAt(e.Location) >= 0 ? 0 : -1;   // al pasar por cualquiera se ven los tres símbolos
-        if (light != hoverLight) { hoverLight = light; Invalidate(new Rectangle(0, 0, (int)(100 * S), (int)titleHeight)); }
+        if (light != hoverLight) { hoverLight = light; Invalidate(); }
         if (active != null) { active.Drag(e.Location); Invalidate(); return; }
         if (previewDown) { PreviewDrag(e.Location); Invalidate(); }
         Cursor = PreviewArea.Contains(e.Location) || previewDown ? PreviewCursor(e.Location) : Cursors.Default;
@@ -961,8 +1181,9 @@ abstract class EditorForm : Form
             if (Original != null) Original.Dispose();
             if (PreviewBase != null) PreviewBase.Dispose();
             if (buffer != null) buffer.Dispose();
-            if (backdrop != null) backdrop.Dispose();
-            moveTimer.Dispose();
+            if (content != null) content.Dispose();
+            if (screenBlur != null) screenBlur.Dispose();
+            if (screenBlurSmall != null) screenBlurSmall.Dispose();
         }
         base.Dispose(disposing);
     }
