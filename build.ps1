@@ -16,3 +16,19 @@ $out = if ($args[0]) { $args[0] } else { Join-Path $PSScriptRoot 'Switchify.exe'
 
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Write-Host "Listo: $out"
+
+# Compilación normal (sin ruta de salida): se instala la copia que arranca con Windows.
+# Si está abierta, se cierra, se reemplaza y se vuelve a abrir.
+if (-not $args[0]) {
+    $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Switchify'
+    $installed = Join-Path $installDir 'Switchify.exe'
+    New-Item -ItemType Directory -Force $installDir | Out-Null
+    $running = @(Get-Process Switchify -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $installed })
+    if ($running.Count -gt 0) {
+        $running | Stop-Process -Force
+        $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+    }
+    Copy-Item $out $installed -Force
+    if ($running.Count -gt 0) { Start-Process $installed }
+    Write-Host "Instalado: $installed"
+}
