@@ -126,8 +126,17 @@ class TrayContext : ApplicationContext
             tray.Text = text == null ? "Switchify – arrastra + Shift o Ctrl+Shift+Espacio" : "Switchify – " + text));
         var forceHandle = menu.Handle; // necesario para BeginInvoke desde el hook
 
+        // Si una versión anterior dejó el inicio en la clave Run (que Windows ignoraba), se pasa a la tarea.
+        try { if (RemoveLegacyStartup()) SetStartup(true); }
+        catch { }
+
         var startup = new ToolStripMenuItem("Iniciar con Windows") { Checked = IsStartupEnabled() };
-        startup.Click += delegate { SetStartup(!startup.Checked); startup.Checked = IsStartupEnabled(); };
+        startup.Click += delegate
+        {
+            try { SetStartup(!startup.Checked); }
+            catch (Exception ex) { MessageBox.Show(ex.Message, "Switchify", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+            startup.Checked = IsStartupEnabled();
+        };
 
         var strip = new ContextMenuStrip();
         strip.Items.Add(new ToolStripMenuItem("Switchify") { Enabled = false });
@@ -204,18 +213,83 @@ class TrayContext : ApplicationContext
             "Switchify", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
+    // Inicio con Windows mediante una tarea programada («al iniciar sesión»). La lista de inicio clásica
+    // (clave Run) no sirve: esta versión de Windows 11 se saltaba Switchify sin motivo aparente, aunque
+    // tuviera la misma marca de «activada» que los programas que sí lanzaba.
+    const string TaskName = "Switchify";
+    const string ApprovedKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+
     static bool IsStartupEnabled()
     {
-        using (var key = Registry.CurrentUser.OpenSubKey(RunKey))
-            return key != null && key.GetValue("Switchify") != null;
+        string xml;
+        return Schtasks("/Query /TN \"" + TaskName + "\" /XML", out xml) == 0 && !xml.Contains("<Enabled>false</Enabled>");
     }
 
     static void SetStartup(bool enable)
     {
-        using (var key = Registry.CurrentUser.CreateSubKey(RunKey))
+        string output;
+        if (enable)
         {
-            if (enable) key.SetValue("Switchify", "\"" + Application.ExecutablePath + "\"");
-            else key.DeleteValue("Switchify", false);
+            // Formato de tarea de Windows (UTF-16). Sin límite de tiempo: por defecto Windows corta las tareas
+            // a las 72 horas, y eso cerraría Switchify a los tres días.
+            string user = Environment.UserDomainName + "\\" + Environment.UserName;
+            string xml =
+                "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n" +
+                "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n" +
+                "  <RegistrationInfo><Description>Abre Switchify al iniciar sesión.</Description></RegistrationInfo>\r\n" +
+                "  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + System.Security.SecurityElement.Escape(user) + "</UserId><Delay>PT10S</Delay></LogonTrigger></Triggers>\r\n" +
+                "  <Principals><Principal id=\"Author\"><UserId>" + System.Security.SecurityElement.Escape(user) + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n" +
+                "  <Settings>\r\n" +
+                "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n" +
+                "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n" +
+                "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n" +
+                "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n" +
+                "    <Priority>5</Priority>\r\n" +
+                "    <Enabled>true</Enabled>\r\n" +
+                "  </Settings>\r\n" +
+                "  <Actions Context=\"Author\"><Exec><Command>" + System.Security.SecurityElement.Escape(Application.ExecutablePath) + "</Command></Exec></Actions>\r\n" +
+                "</Task>\r\n";
+            string file = Path.Combine(Path.GetTempPath(), "Switchify-tarea.xml");
+            File.WriteAllText(file, xml, System.Text.Encoding.Unicode);
+            try
+            {
+                if (Schtasks("/Create /TN \"" + TaskName + "\" /XML \"" + file + "\" /F", out output) != 0)
+                    throw new InvalidOperationException("No se pudo crear la tarea de inicio: " + output.Trim());
+            }
+            finally { File.Delete(file); }
+        }
+        else
+        {
+            Schtasks("/Delete /TN \"" + TaskName + "\" /F", out output);
+        }
+        RemoveLegacyStartup();
+    }
+
+    // Versiones anteriores usaban la clave Run (y su marca de aprobación): se quitan para no dejar restos.
+    static bool RemoveLegacyStartup()
+    {
+        bool found = false;
+        using (var key = Registry.CurrentUser.OpenSubKey(RunKey, true))
+            if (key != null && key.GetValue("Switchify") != null) { key.DeleteValue("Switchify", false); found = true; }
+        using (var approved = Registry.CurrentUser.OpenSubKey(ApprovedKey, true))
+            if (approved != null) approved.DeleteValue("Switchify", false);
+        return found;
+    }
+
+    static int Schtasks(string args, out string output)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo("schtasks.exe", args)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        using (var p = System.Diagnostics.Process.Start(psi))
+        {
+            output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+            p.WaitForExit();
+            return p.ExitCode;
         }
     }
 
