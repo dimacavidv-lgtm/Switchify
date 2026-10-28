@@ -75,7 +75,10 @@ static class Documents
         if (ext == ".html" || ext == ".htm")
         {
             if (target != ".pdf") throw new NotSupportedException("HTML solo se puede convertir a PDF.");
-            Edge.PrintToPdf(input, output);
+            // Un navegador respeta el CSS del HTML; sin ninguno instalado, se maqueta su estructura.
+            string browser = Browser.Find();
+            if (browser != null) Browser.PrintToPdf(browser, input, output);
+            else DocumentPdf.Write(HtmlReader.Read(File.ReadAllText(input)), output, Path.GetDirectoryName(input));
             return output;
         }
 
@@ -122,19 +125,8 @@ static class Documents
             case ".html": File.WriteAllText(output, HtmlWriter.Write(blocks, title, null), utf8); break;
             case ".docx": DocxWriter.Write(blocks, output); break;
             case ".pdf":
-                string tempDir = Path.Combine(Path.GetTempPath(), "Switchify");
-                Directory.CreateDirectory(tempDir);
-                string html = Path.Combine(tempDir, Guid.NewGuid().ToString("N") + ".html");
-                try
-                {
-                    // <base> apunta a la carpeta original para que las imágenes relativas se vean en el PDF.
-                    File.WriteAllText(html, HtmlWriter.Write(blocks, title, baseDir), utf8);
-                    Edge.PrintToPdf(html, output);
-                }
-                finally
-                {
-                    try { File.Delete(html); } catch { }
-                }
+                // Maquetación propia + impresora PDF de Windows: no hace falta ningún navegador.
+                DocumentPdf.Write(blocks, output, baseDir);
                 break;
             default: throw new NotSupportedException("Formato no soportado: " + target);
         }
@@ -1060,53 +1052,17 @@ static class Ocr
     }
 }
 
-static class Edge
-{
-    static readonly object Gate = new object();
-
-    static string FindExe()
-    {
-        var candidates = new[]
-        {
-            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
-            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)
-        };
-        return candidates
-            .Select(dir => Path.Combine(dir, @"Microsoft\Edge\Application\msedge.exe"))
-            .FirstOrDefault(File.Exists);
-    }
-
-    public static void PrintToPdf(string htmlPath, string pdfPath)
-    {
-        string exe = FindExe();
-        if (exe == null) throw new FileNotFoundException("Hace falta Microsoft Edge para crear PDF.");
-
-        // Perfil propio para no interferir con el Edge que tenga abierto el usuario.
-        string profile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Switchify", "edge");
-        string args = string.Format("--headless --disable-gpu --no-first-run --no-default-browser-check --no-pdf-header-footer " +
-                                    "--user-data-dir=\"{0}\" --print-to-pdf=\"{1}\" \"{2}\"",
-                                    profile, pdfPath, new Uri(htmlPath).AbsoluteUri);
-        var psi = new ProcessStartInfo(exe, args) { UseShellExecute = false, CreateNoWindow = true };
-        // De uno en uno: dos Edge con el mismo perfil a la vez hacen que el segundo termine sin generar nada.
-        lock (Gate)
-        {
-            using (var p = Process.Start(psi))
-            {
-                if (!p.WaitForExit(120000))
-                {
-                    try { p.Kill(); } catch { }
-                    throw new TimeoutException("Edge tardó demasiado en generar el PDF.");
-                }
-            }
-        }
-        if (!File.Exists(pdfPath)) throw new IOException("Edge no generó el PDF.");
-    }
-}
-
-// Varias imágenes -> un PDF (una página por imagen, JPEG incrustado).
+// Imágenes -> PDF (una página por imagen, JPEG incrustado).
 static class PdfWriter
 {
+    class PdfPage
+    {
+        public byte[] Jpeg;
+        public int Width, Height;        // píxeles de la imagen
+        public double PageW, PageH;      // tamaño de la página en puntos
+    }
+
+    // Varias imágenes elegidas por el usuario -> un PDF; cada página mide lo que la imagen a 96 ppp.
     public static string FromImages(List<string> inputs)
     {
         string first = inputs[0];
@@ -1114,6 +1070,24 @@ static class PdfWriter
             ? Paths.Beside(first, "", ".pdf")
             : Paths.Unique(Path.GetDirectoryName(first), "Imágenes", ".pdf");
 
+        var pages = new List<PdfPage>();
+        foreach (var input in inputs)
+        {
+            using (var bmp = ImageOps.Load(input))
+                pages.Add(new PdfPage { Jpeg = ImageOps.ToJpeg(bmp, 90), Width = bmp.Width, Height = bmp.Height, PageW = bmp.Width * 0.75, PageH = bmp.Height * 0.75 });
+        }
+        Write(pages, output);
+        return output;
+    }
+
+    // Páginas ya dibujadas (respaldo de los documentos sin impresora PDF), todas del mismo tamaño en puntos.
+    public static void FromBitmaps(IList<Bitmap> bitmaps, float pageWidth, float pageHeight, string output)
+    {
+        Write(bitmaps.Select(b => new PdfPage { Jpeg = ImageOps.ToJpeg(b, 88), Width = b.Width, Height = b.Height, PageW = pageWidth, PageH = pageHeight }).ToList(), output);
+    }
+
+    static void Write(List<PdfPage> pages, string output)
+    {
         var inv = CultureInfo.InvariantCulture;
         using (var fs = File.Create(output))
         {
@@ -1122,22 +1096,15 @@ static class PdfWriter
             Action beginObj = () => { offsets.Add(fs.Position); write(offsets.Count + " 0 obj\n"); };
 
             write("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
-            int n = inputs.Count;
+            int n = pages.Count;
             beginObj(); write("<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
             beginObj();
             write("<< /Type /Pages /Count " + n + " /Kids [" + string.Join(" ", Enumerable.Range(0, n).Select(i => (3 + i * 3) + " 0 R")) + "] >>\nendobj\n");
 
             for (int i = 0; i < n; i++)
             {
-                byte[] jpeg;
-                int w, h;
-                using (var bmp = ImageOps.Load(inputs[i]))
-                {
-                    w = bmp.Width; h = bmp.Height;
-                    jpeg = ImageOps.ToJpeg(bmp, 90);
-                }
-                // 96 ppp -> puntos PDF (72 por pulgada).
-                string pw = (w * 0.75).ToString("0.##", inv), ph = (h * 0.75).ToString("0.##", inv);
+                var p = pages[i];
+                string pw = p.PageW.ToString("0.##", inv), ph = p.PageH.ToString("0.##", inv);
                 string content = "q " + pw + " 0 0 " + ph + " 0 0 cm /Im0 Do Q";
 
                 beginObj();
@@ -1146,9 +1113,9 @@ static class PdfWriter
                 beginObj();
                 write("<< /Length " + content.Length + " >>\nstream\n" + content + "\nendstream\nendobj\n");
                 beginObj();
-                write("<< /Type /XObject /Subtype /Image /Width " + w + " /Height " + h +
-                      " /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length " + jpeg.Length + " >>\nstream\n");
-                fs.Write(jpeg, 0, jpeg.Length);
+                write("<< /Type /XObject /Subtype /Image /Width " + p.Width + " /Height " + p.Height +
+                      " /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length " + p.Jpeg.Length + " >>\nstream\n");
+                fs.Write(p.Jpeg, 0, p.Jpeg.Length);
                 write("\nendstream\nendobj\n");
             }
 
@@ -1157,6 +1124,5 @@ static class PdfWriter
             foreach (var o in offsets) write(o.ToString("D10") + " 00000 n \n");
             write("trailer\n<< /Size " + (offsets.Count + 1) + " /Root 1 0 R >>\nstartxref\n" + xref + "\n%%EOF\n");
         }
-        return output;
     }
 }
