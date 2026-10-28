@@ -539,7 +539,7 @@ abstract class EditorForm : Form
         finally { bmp.UnlockBits(data); }
     }
 
-    static void WritePixels(Bitmap bmp, int[] px)
+    internal static void WritePixels(Bitmap bmp, int[] px)
     {
         var data = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height), ImageLockMode.WriteOnly, PixelFormat.Format32bppPArgb);
         try
@@ -551,7 +551,7 @@ abstract class EditorForm : Form
     }
 
     // Ampliación bilineal en punto fijo (8 bits de fracción) sobre píxeles BGRA.
-    static int[] UpscaleBilinear(int[] src, int sw, int sh, int dw, int dh)
+    internal static int[] UpscaleBilinear(int[] src, int sw, int sh, int dw, int dh)
     {
         var dst = new int[dw * dh];
         var x0 = new int[dw]; var x1 = new int[dw]; var fx = new int[dw];

@@ -36,7 +36,11 @@ if (-not $args[0]) {
         $running | Stop-Process -Force
         $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
     }
-    Copy-Item $out $installed -Force
+    # Windows tarda a veces un momento en soltar el .exe de un proceso recién cerrado: se reintenta unos segundos.
+    for ($try = 1; ; $try++) {
+        try { Copy-Item $out $installed -Force -ErrorAction Stop; break }
+        catch { if ($try -ge 20) { throw } ; Start-Sleep -Milliseconds 500 }
+    }
     if ($running.Count -gt 0) { Start-Process $installed }
     Write-Host "Instalado: $installed"
 }

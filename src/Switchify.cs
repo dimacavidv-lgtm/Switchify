@@ -114,6 +114,62 @@ static class Native
         }
     }
 
+    // Superficie para una ventana en capas: un bitmap de GDI+ que escribe directamente en la memoria que se
+    // entrega a Windows. Así cada fotograma no copia el bitmap entero (GetHbitmap) ni crea objetos nuevos,
+    // y la opacidad de toda la ventana (fundidos) la aplica Windows sin coste.
+    public sealed class LayeredSurface : IDisposable
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        struct BITMAPINFOHEADER
+        {
+            public int biSize, biWidth, biHeight;
+            public short biPlanes, biBitCount;
+            public int biCompression, biSizeImage, biXPelsPerMeter, biYPelsPerMeter, biClrUsed, biClrImportant;
+        }
+        [DllImport("gdi32.dll")] static extern IntPtr CreateDIBSection(IntPtr hdc, ref BITMAPINFOHEADER bmi, int usage, out IntPtr bits, IntPtr section, int offset);
+        [DllImport("gdi32.dll")] static extern bool GdiFlush();
+
+        public readonly Bitmap Bitmap;
+        readonly IntPtr mem, dib, old;
+        readonly int width, height;
+
+        public LayeredSurface(int width, int height)
+        {
+            this.width = width; this.height = height;
+            var bmi = new BITMAPINFOHEADER { biSize = Marshal.SizeOf(typeof(BITMAPINFOHEADER)), biWidth = width, biHeight = -height, biPlanes = 1, biBitCount = 32 };
+            IntPtr screenDc = GetDC(IntPtr.Zero);
+            mem = CreateCompatibleDC(screenDc);
+            IntPtr bits;
+            dib = CreateDIBSection(screenDc, ref bmi, 0, out bits, IntPtr.Zero, 0);
+            ReleaseDC(IntPtr.Zero, screenDc);
+            old = SelectObject(mem, dib);
+            Bitmap = new Bitmap(width, height, width * 4, PixelFormat.Format32bppPArgb, bits);
+        }
+
+        public void Present(Form form, byte opacity)
+        {
+            GdiFlush();
+            IntPtr screenDc = GetDC(IntPtr.Zero);
+            try
+            {
+                var size = new SIZE { CX = width, CY = height };
+                var src = new POINT();
+                var dst = new POINT { X = form.Left, Y = form.Top };
+                var blend = new BLENDFUNCTION { BlendOp = 0, SourceConstantAlpha = opacity, AlphaFormat = 1 };
+                UpdateLayeredWindow(form.Handle, screenDc, ref dst, ref size, mem, ref src, 0, ref blend, 2);
+            }
+            finally { ReleaseDC(IntPtr.Zero, screenDc); }
+        }
+
+        public void Dispose()
+        {
+            Bitmap.Dispose();
+            SelectObject(mem, old);
+            DeleteObject(dib);
+            DeleteDC(mem);
+        }
+    }
+
     public static bool LeftButtonDown()
     {
         // Respeta el intercambio de botones del ratón para zurdos.
@@ -145,12 +201,19 @@ class TrayContext : ApplicationContext
     // Shift: «arrastrar + Shift» se dispara al pulsar con el botón apretado; «ratón encima + Shift», con un
     // toque de Shift solo (pulsar y soltar rápido, sin otra tecla ni clic entremedias) o manteniéndolo
     // con el ratón quieto (el anillo vive mientras Shift siga pulsado y al soltarlo se usa la opción de debajo).
+    // Los ganchos viven en su propio hilo: Windows espera su respuesta en cada tecla y cada movimiento del ratón,
+    // y si compartieran hilo con el anillo, mientras este dibuja se trabaría el ratón de todo el sistema.
     const int HoldMs = 400;
-    bool shiftHeld, shiftWithOther, shiftForDrag, shiftMoved;
+    volatile bool shiftHeld, shiftWithOther, shiftForDrag, shiftMoved;
     Point shiftStart;
     readonly Stopwatch shiftClock = new Stopwatch();
     readonly System.Windows.Forms.Timer holdTimer = new System.Windows.Forms.Timer { Interval = HoldMs };
     bool hoverBusy;
+    // Búsqueda del archivo bajo el cursor, adelantada al pulsar Shift: al soltarlo (o a los 400 ms) ya está hecha.
+    Task<HoverResult> lookup;
+    Point lookupAt;
+
+    class HoverResult { public List<string> Files; public Backdrop.Small Backdrop; public Rectangle Rect; }
 
     public TrayContext()
     {
@@ -189,15 +252,22 @@ class TrayContext : ApplicationContext
             Visible = true
         };
         tray.DoubleClick += delegate { ShowHelp(); };
+        new TraySpinner(tray);
 
         hotkey = new HotkeyWindow(OnHotkey);
         if (!hotkey.Register(Native.MOD_CONTROL | Native.MOD_SHIFT | Native.MOD_NOREPEAT, Native.VK_SPACE))
             tray.ShowBalloonTip(4000, "Switchify", "Ctrl+Shift+Espacio ya está en uso por otro programa. El modo arrastrar + Shift sigue funcionando.", ToolTipIcon.Warning);
 
         hookProc = KeyboardHook;
-        hookHandle = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, hookProc, Native.GetModuleHandle(null), 0);
         mouseProc = MouseHook;
-        mouseHandle = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, mouseProc, Native.GetModuleHandle(null), 0);
+        var hooks = new Thread(() =>
+        {
+            hookHandle = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, hookProc, Native.GetModuleHandle(null), 0);
+            mouseHandle = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, mouseProc, Native.GetModuleHandle(null), 0);
+            Application.Run();   // bucle de mensajes: los ganchos se llaman desde aquí
+        });
+        hooks.IsBackground = true;
+        hooks.Start();
         HoverFiles.Warm();
 
         holdTimer.Tick += delegate
@@ -208,6 +278,12 @@ class TrayContext : ApplicationContext
             if (shiftHeld && !shiftWithOther && !shiftMoved && !shiftForDrag && !Native.AnyButtonDown())
                 ShowForHover(Cursor.Position, true);
         };
+    }
+
+    // Lo que piden los ganchos se hace en el hilo del anillo.
+    void OnUi(Action a)
+    {
+        try { menu.BeginInvoke(a); } catch (InvalidOperationException) { }
     }
 
     IntPtr KeyboardHook(int nCode, IntPtr wParam, IntPtr lParam)
@@ -230,22 +306,24 @@ class TrayContext : ApplicationContext
                     shiftStart = Cursor.Position;
                     shiftForDrag = Native.LeftButtonDown();
                     shiftClock.Restart();
-                    if (shiftForDrag) menu.BeginInvoke(new Action(menu.ShowForDrag));
-                    else holdTimer.Start();
+                    var at = shiftStart;
+                    if (shiftForDrag) OnUi(menu.ShowForDrag);
+                    else OnUi(() => { StartLookup(at); holdTimer.Stop(); holdTimer.Start(); });
                 }
             }
             else if (isShift && up)
             {
-                holdTimer.Stop();
-                // Abierto manteniendo Shift: al soltarlo se usa la opción bajo el cursor (o se cierra).
-                if (menu.Holding) menu.BeginInvoke(new Action(menu.ReleaseHold));
                 // Toque de Shift solo, con el ratón quieto: el anillo para el archivo que haya bajo el cursor.
-                else if (shiftHeld && !shiftWithOther && !shiftForDrag && shiftClock.ElapsedMilliseconds < HoldMs && !Native.AnyButtonDown())
-                {
-                    var p = Cursor.Position;
-                    menu.BeginInvoke(new Action(() => ShowForHover(p, false)));
-                }
+                bool tap = shiftHeld && !shiftWithOther && !shiftForDrag && shiftClock.ElapsedMilliseconds < HoldMs && !Native.AnyButtonDown();
+                var p = Cursor.Position;
                 shiftHeld = false;
+                OnUi(() =>
+                {
+                    holdTimer.Stop();
+                    // Abierto manteniendo Shift: al soltarlo se usa la opción bajo el cursor (o se cierra).
+                    if (menu.Holding) menu.ReleaseHold();
+                    else if (tap) ShowForHover(p, false);
+                });
             }
             else if (down && shiftHeld)
             {
@@ -272,26 +350,48 @@ class TrayContext : ApplicationContext
         return Native.CallNextHookEx(mouseHandle, nCode, wParam, lParam);
     }
 
-    // Busca el archivo bajo el cursor en un hilo aparte (STA, para el Explorador) y abre el anillo si lo hay.
-    void ShowForHover(Point p, bool hold)
+    // Busca el archivo bajo el cursor en un hilo aparte (STA, para el Explorador).
+    // Si es el Explorador o el Escritorio, a la vez se captura el cristal del anillo (lo que tarda Windows en
+    // copiar la pantalla se solapa con la búsqueda).
+    void StartLookup(Point p)
     {
-        if (hoverBusy || menu.Visible) return;
-        hoverBusy = true;
+        var source = new TaskCompletionSource<HoverResult>();
+        var rect = menu.BoundsAt(p);
+        bool glass = !menu.Visible && menu.WantsBackdrop;
         var thread = new Thread(() =>
         {
-            List<string> files;
-            try { files = HoverFiles.Get(p.X, p.Y); }
-            catch { files = new List<string>(); }
-            menu.BeginInvoke(new Action(() =>
+            var result = new HoverResult { Files = new List<string>(), Rect = rect };
+            Task<Backdrop.Small> capture = null;
+            try
             {
-                hoverBusy = false;
-                // Si Shift se soltó mientras se buscaba el archivo, el modo mantenido ya no tiene sentido.
-                if (files.Count > 0 && !menu.Visible && (!hold || shiftHeld)) menu.ShowForFiles(files, hold);
-            }));
+                if (glass && HoverFiles.IsFileWindowAt(p.X, p.Y)) capture = Task.Run(() => Backdrop.Capture(rect));
+                result.Files = HoverFiles.Get(p.X, p.Y);
+                if (capture != null) result.Backdrop = capture.Result;
+            }
+            catch { }
+            source.SetResult(result);
         });
         thread.SetApartmentState(ApartmentState.STA);
         thread.IsBackground = true;
         thread.Start();
+        lookup = source.Task;
+        lookupAt = p;
+    }
+
+    // Abre el anillo para el archivo bajo el cursor, si lo hay. Se aprovecha la búsqueda empezada al pulsar Shift
+    // si el ratón sigue en el mismo sitio.
+    void ShowForHover(Point p, bool hold)
+    {
+        if (hoverBusy || menu.Visible) return;
+        if (lookup == null || Math.Abs(p.X - lookupAt.X) > 6 || Math.Abs(p.Y - lookupAt.Y) > 6) StartLookup(p);
+        hoverBusy = true;
+        lookup.ContinueWith(task => OnUi(() =>
+        {
+            hoverBusy = false;
+            // Si Shift se soltó mientras se buscaba el archivo, el modo mantenido ya no tiene sentido.
+            var r = task.Result;
+            if (r.Files.Count > 0 && !menu.Visible && (!hold || shiftHeld)) menu.ShowForFiles(r.Files, hold, r.Backdrop, r.Rect);
+        }));
     }
 
     void OnHotkey()
@@ -632,6 +732,45 @@ static class Theme
         return Embedded(null) ?? MakeTrayIcon();
     }
 
+    // El logo en color a un tamaño concreto (para la rueda de carga); null si faltara el recurso.
+    // Los tamaños grandes del .ico van en PNG, que Icon.ToBitmap no sabe leer (sale ruido): se busca en el
+    // directorio del .ico la imagen más pequeña que llegue al tamaño pedido y se lee como PNG.
+    public static Bitmap Logo(int size)
+    {
+        try
+        {
+            using (var stream = typeof(Theme).Assembly.GetManifestResourceStream("Switchify.ico"))
+            {
+                if (stream == null) return null;
+                var data = new byte[stream.Length];
+                stream.Read(data, 0, data.Length);
+                int count = BitConverter.ToUInt16(data, 4), best = -1, bestSize = int.MaxValue;
+                for (int i = 0; i < count; i++)
+                {
+                    int w = data[6 + i * 16] == 0 ? 256 : data[6 + i * 16];
+                    int offset = BitConverter.ToInt32(data, 6 + i * 16 + 12);
+                    bool png = data[offset] == 0x89 && data[offset + 1] == (byte)'P';
+                    if (png && w >= size && w < bestSize) { best = i; bestSize = w; }
+                }
+                if (best < 0) return null;
+                int length = BitConverter.ToInt32(data, 6 + best * 16 + 8), start = BitConverter.ToInt32(data, 6 + best * 16 + 12);
+                using (var ms = new MemoryStream(data, start, length))
+                using (var img = Image.FromStream(ms))
+                {
+                    var bmp = new Bitmap(size, size, PixelFormat.Format32bppPArgb);
+                    using (var g = Graphics.FromImage(bmp))
+                    {
+                        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                        g.DrawImage(img, 0, 0, size, size);
+                    }
+                    return bmp;
+                }
+            }
+        }
+        catch { return null; }
+    }
+
     // Respaldo si faltara el recurso: el icono dibujado de antes.
     static Icon MakeTrayIcon()
     {
@@ -648,6 +787,121 @@ static class Theme
                     g.DrawArc(pen, 7, 7, 18, 18, -90 + i * 60 + 8, 44);
             }
             return Icon.FromHandle(bmp.GetHicon());
+        }
+    }
+}
+
+// Cristal del anillo: lo que hay detrás, desenfocado y algo saturado (como el "vibrancy" de Apple).
+// Se captura ya reducido a 1/4 (Windows promedia los píxeles al copiar) y se desenfoca con aritmética propia:
+// así cuesta unos pocos milisegundos en vez de los ~70 de escalar con GDI+ a alta calidad.
+static class Backdrop
+{
+    public const int Factor = 4;
+
+    public class Small { public int[] Pixels; public int Width, Height; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct BITMAPINFOHEADER
+    {
+        public int biSize, biWidth, biHeight;
+        public short biPlanes, biBitCount;
+        public int biCompression, biSizeImage, biXPelsPerMeter, biYPelsPerMeter, biClrUsed, biClrImportant;
+    }
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr hDC);
+    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr hdc);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr hDC, IntPtr hObject);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr hObject);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateDIBSection(IntPtr hdc, ref BITMAPINFOHEADER bmi, int usage, out IntPtr bits, IntPtr section, int offset);
+    [DllImport("gdi32.dll")] static extern int SetStretchBltMode(IntPtr hdc, int mode);
+    [DllImport("gdi32.dll")] static extern bool StretchBlt(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, int sw, int sh, int rop);
+
+    public static Small Capture(Rectangle area)
+    {
+        int w = Math.Max(1, area.Width / Factor), h = Math.Max(1, area.Height / Factor);
+        var px = new int[w * h];
+        var bmi = new BITMAPINFOHEADER { biSize = Marshal.SizeOf(typeof(BITMAPINFOHEADER)), biWidth = w, biHeight = -h, biPlanes = 1, biBitCount = 32 };
+        IntPtr screenDc = GetDC(IntPtr.Zero);
+        IntPtr mem = CreateCompatibleDC(screenDc);
+        IntPtr bits;
+        IntPtr dib = CreateDIBSection(screenDc, ref bmi, 0, out bits, IntPtr.Zero, 0);
+        IntPtr old = SelectObject(mem, dib);
+        try
+        {
+            SetStretchBltMode(mem, 4);   // HALFTONE: promedia en lugar de saltarse píxeles
+            StretchBlt(mem, 0, 0, w, h, screenDc, area.X, area.Y, area.Width, area.Height, 0x00CC0020);
+            Marshal.Copy(bits, px, 0, px.Length);
+        }
+        finally
+        {
+            SelectObject(mem, old);
+            DeleteObject(dib);
+            DeleteDC(mem);
+            ReleaseDC(IntPtr.Zero, screenDc);
+        }
+        Saturate(px, 1.6);
+        // Tres pasadas de caja ≈ desenfoque gaussiano (unos 18 px a tamaño real).
+        for (int pass = 0; pass < 3; pass++) BoxBlur(px, w, h, 4);
+        return new Small { Pixels = px, Width = w, Height = h };
+    }
+
+    // Ampliado al tamaño de la ventana, listo para dibujar.
+    public static Bitmap ToBitmap(Small small, int width, int height)
+    {
+        var full = EditorForm.UpscaleBilinear(small.Pixels, small.Width, small.Height, width, height);
+        var bmp = new Bitmap(width, height, PixelFormat.Format32bppPArgb);
+        EditorForm.WritePixels(bmp, full);
+        return bmp;
+    }
+
+    public static double Lum(int c)
+    {
+        return (0.2126 * ((c >> 16) & 255) + 0.7152 * ((c >> 8) & 255) + 0.0722 * (c & 255)) / 255;
+    }
+
+    // Saturación con la matriz de luminancia de siempre, en enteros (y alfa opaco).
+    static void Saturate(int[] px, double s)
+    {
+        int k = (int)(s * 256), rest = 256 - k;
+        for (int i = 0; i < px.Length; i++)
+        {
+            int c = px[i], r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+            int l = (54 * r + 183 * g + 19 * b) >> 8;           // 0.2126, 0.7152, 0.0722
+            int lr = l * rest;
+            r = Clamp((lr + r * k) >> 8); g = Clamp((lr + g * k) >> 8); b = Clamp((lr + b * k) >> 8);
+            px[i] = unchecked((int)0xFF000000) | (r << 16) | (g << 8) | b;
+        }
+    }
+
+    static int Clamp(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
+
+    // Media móvil horizontal y luego vertical (bordes repetidos).
+    static void BoxBlur(int[] px, int w, int h, int radius)
+    {
+        var tmp = new int[px.Length];
+        int n = radius * 2 + 1;
+        for (int y = 0; y < h; y++)
+        {
+            int row = y * w, r = 0, g = 0, b = 0;
+            for (int i = -radius; i <= radius; i++) { int c = px[row + Math.Min(w - 1, Math.Max(0, i))]; r += (c >> 16) & 255; g += (c >> 8) & 255; b += c & 255; }
+            for (int x = 0; x < w; x++)
+            {
+                tmp[row + x] = unchecked((int)0xFF000000) | (r / n << 16) | (g / n << 8) | b / n;
+                int cOut = px[row + Math.Max(0, x - radius)], cIn = px[row + Math.Min(w - 1, x + radius + 1)];
+                r += ((cIn >> 16) & 255) - ((cOut >> 16) & 255); g += ((cIn >> 8) & 255) - ((cOut >> 8) & 255); b += (cIn & 255) - (cOut & 255);
+            }
+        }
+        for (int x = 0; x < w; x++)
+        {
+            int r = 0, g = 0, b = 0;
+            for (int i = -radius; i <= radius; i++) { int c = tmp[Math.Min(h - 1, Math.Max(0, i)) * w + x]; r += (c >> 16) & 255; g += (c >> 8) & 255; b += c & 255; }
+            for (int y = 0; y < h; y++)
+            {
+                px[y * w + x] = unchecked((int)0xFF000000) | (r / n << 16) | (g / n << 8) | b / n;
+                int cOut = tmp[Math.Max(0, y - radius) * w + x], cIn = tmp[Math.Min(h - 1, y + radius + 1) * w + x];
+                r += ((cIn >> 16) & 255) - ((cOut >> 16) & 255); g += ((cIn >> 8) & 255) - ((cOut >> 8) & 255); b += (cIn & 255) - (cOut & 255);
+            }
         }
     }
 }
@@ -673,7 +927,15 @@ class RadialMenu : Form
     List<string> files = new List<string>();
     Look look = Look.Current();
     Bitmap backdrop;                                    // lo que hay detrás, ya desenfocado
-    Bitmap frame, scene, baseLayer;                     // bitmaps reutilizados entre fotogramas
+    Backdrop.Small backdropSmall;                       // el mismo a 1/4, para medir luminosidad sin GetPixel
+    Native.LayeredSurface surface;                      // lo que se entrega a Windows en cada fotograma
+    Bitmap scene, baseLayer;                            // bitmaps reutilizados entre fotogramas
+    bool sceneDirty = true;                             // la escena cambió (hay que redibujarla para animar la entrada)
+    Bitmap[] labelImages;                               // cada etiqueta en reposo, ya con su halo
+    Point[] labelOrigins;
+    Bitmap centerImage;                                 // los textos del centro, ya con su halo
+    string centerKey;
+    Point centerOrigin;
     GraphicsPath[] labelPaths;                          // texto de cada etiqueta, ya convertido en trazado
     bool[] labelLight;                                  // por etiqueta: texto claro (fondo oscuro detrás) u oscuro
     bool centerLight;
@@ -763,12 +1025,22 @@ class RadialMenu : Form
 
     void PlaceAtCursor()
     {
-        var p = Cursor.Position;
+        Location = BoundsAt(Cursor.Position).Location;
+    }
+
+    // Dónde quedaría el anillo abierto en ese punto (centrado en él, sin salirse de la pantalla).
+    public Rectangle BoundsAt(Point p)
+    {
         var area = Screen.FromPoint(p).WorkingArea;
         int x = Math.Max(area.Left - pad, Math.Min(p.X - center, area.Right - Width + pad));
         int y = Math.Max(area.Top - pad, Math.Min(p.Y - center, area.Bottom - Height + pad));
-        Location = new Point(x, y);
+        return new Rectangle(x, y, Width, Height);
     }
+
+    // El cristal también lo puede capturar quien busca el archivo, a la vez que lo busca (ver TrayContext).
+    public bool WantsBackdrop { get { return !Look.Current().Solid; } }
+    Backdrop.Small preparedBackdrop;
+    Rectangle preparedRect;
 
     void Prepare(List<string> selected)
     {
@@ -780,8 +1052,20 @@ class RadialMenu : Form
         PlaceAtCursor();
         // El fondo se captura antes de mostrar la ventana (las ventanas en capas no salen en la captura).
         if (backdrop != null) backdrop.Dispose();
-        backdrop = look.Solid ? null : CaptureBackdrop();
-        if (backdrop != null) look.AdaptTo(Luminance(backdrop));
+        backdrop = null;
+        backdropSmall = null;
+        if (!look.Solid)
+        {
+            try
+            {
+                var rect = new Rectangle(Location, Size);
+                backdropSmall = preparedBackdrop != null && preparedRect == rect ? preparedBackdrop : Backdrop.Capture(rect);
+                backdrop = Backdrop.ToBitmap(backdropSmall, Width, Height);
+            }
+            catch { backdrop = null; backdropSmall = null; }
+        }
+        preparedBackdrop = null;
+        if (backdrop != null) look.AdaptTo(Luminance());
         InvalidateCache();
         appear.Snap(0);
     }
@@ -801,8 +1085,10 @@ class RadialMenu : Form
 
     public bool Holding { get { return holdMode && Visible && !closing; } }
 
-    public void ShowForFiles(List<string> selected, bool hold)
+    public void ShowForFiles(List<string> selected, bool hold, Backdrop.Small captured = null, Rectangle capturedAt = default(Rectangle))
     {
+        preparedBackdrop = captured;
+        preparedRect = capturedAt;
         dragMode = false;
         holdMode = hold;
         showing = true;
@@ -864,6 +1150,7 @@ class RadialMenu : Form
         revealed = false;
         Hide();
         if (backdrop != null) { backdrop.Dispose(); backdrop = null; }
+        backdropSmall = null;
         InvalidateCache();
     }
 
@@ -958,6 +1245,7 @@ class RadialMenu : Form
         // Al cerrar, la opción elegida se queda resaltada mientras el menú se va.
         if (closing || index == hover) return;
         hover = index;
+        sceneDirty = true;
         if (pressed != index) pressed = -1;
         dwellTimer.Stop();
         if (index != noDwell) noDwell = -1;
@@ -1015,6 +1303,7 @@ class RadialMenu : Form
         // La respuesta llega al pulsar, no al soltar.
         if (dragMode || e.Button != MouseButtons.Left || closing) return;
         pressed = HitTest(e.Location);
+        sceneDirty = true;
         Render();
     }
 
@@ -1024,7 +1313,7 @@ class RadialMenu : Form
         if (dragMode || e.Button != MouseButtons.Left || closing) return;
         int chosen = HitTest(e.Location);
         var selected = files;
-        if (chosen >= 0 && chosen != pressed) { pressed = -1; Render(); return; } // soltó en otra opción: se cancela
+        if (chosen >= 0 && chosen != pressed) { pressed = -1; sceneDirty = true; Render(); return; } // soltó en otra opción: se cancela
         pressed = -1;
         if (chosen >= 0 && actions[chosen].SubActions != null) { SwitchPage(chosen); return; }
         HideMenu();
@@ -1061,6 +1350,10 @@ class RadialMenu : Form
         }
         if (action.Slow && ActionFinished != null)
             ActionFinished(action.Description + "…", "Te aviso cuando termine. El progreso se ve en el icono de la bandeja.", false);
+        // El logo girando donde estaba el anillo hasta que el archivo está creado.
+        var spinner = new Spinner(new Point(Left + center, Top + center));
+        spinner.Start();
+        Activity.Begin();
         Task.Factory.StartNew(() =>
         {
             var outputs = new List<string>();
@@ -1082,6 +1375,8 @@ class RadialMenu : Form
             GC.WaitForPendingFinalizers();
             BeginInvoke(new Action(() =>
             {
+                spinner.Finish(errors.Count == 0);
+                Activity.End();
                 if (ActionFinished == null) return;
                 if (errors.Count > 0)
                     ActionFinished("Switchify – error", string.Join("\n", errors.Take(3)), true);
@@ -1108,90 +1403,22 @@ class RadialMenu : Form
 
     // --- Material: captura del fondo desenfocada y saturada --------------------------------
 
-    Bitmap CaptureBackdrop()
+    // Luminosidad media (0 = negro, 1 = blanco) del fondo bajo el anillo.
+    double Luminance()
     {
-        try
-        {
-            using (var shot = new Bitmap(Width, Height, PixelFormat.Format32bppArgb))
-            {
-                using (var g = Graphics.FromImage(shot)) g.CopyFromScreen(Location, Point.Empty, Size);
-                return Blur(shot);
-            }
-        }
-        catch { return null; }
-    }
-
-    // Luminosidad media (0 = negro, 1 = blanco) del fondo bajo el anillo, muestreando una rejilla.
-    double Luminance(Bitmap bmp)
-    {
+        var b = backdropSmall;
         double sum = 0;
-        int count = 0, step = Math.Max(4, outerR / 12);
-        for (int y = pad; y < pad + outerR * 2; y += step)
-        {
-            for (int x = pad; x < pad + outerR * 2; x += step)
+        int count = 0;
+        double c0 = center / (double)Backdrop.Factor, r = outerR / (double)Backdrop.Factor;
+        for (int y = 0; y < b.Height; y++)
+            for (int x = 0; x < b.Width; x++)
             {
-                double dx = x - center, dy = y - center;
-                if (dx * dx + dy * dy > (double)outerR * outerR) continue;
-                var c = bmp.GetPixel(x, y);
-                sum += (0.2126 * c.R + 0.7152 * c.G + 0.0722 * c.B) / 255;
+                double dx = x + 0.5 - c0, dy = y + 0.5 - c0;
+                if (dx * dx + dy * dy > r * r) continue;
+                sum += Backdrop.Lum(b.Pixels[y * b.Width + x]);
                 count++;
             }
-        }
         return count == 0 ? 0.5 : sum / count;
-    }
-
-    public static Bitmap Blur(Bitmap src)
-    {
-        // Desenfoque barato y suave: reducir mucho y volver a ampliar con bicúbico.
-        // Se satura un poco (como el "vibrancy" de Apple) para que el color de detrás se note a través del cristal.
-        const float s = 1.6f;
-        float[] lum = { 0.2126f, 0.7152f, 0.0722f };
-        var m = new float[5][];
-        for (int r = 0; r < 3; r++)
-        {
-            m[r] = new float[5];
-            for (int c = 0; c < 3; c++) m[r][c] = (1 - s) * lum[r] + (r == c ? s : 0);
-        }
-        m[3] = new float[] { 0, 0, 0, 1, 0 };
-        m[4] = new float[] { 0, 0, 0, 0, 1 };
-
-        using (var attrs = new ImageAttributes())
-        using (var mid = new Bitmap(Math.Max(1, src.Width / 4), Math.Max(1, src.Height / 4)))
-        using (var tiny = new Bitmap(Math.Max(1, src.Width / 40), Math.Max(1, src.Height / 40)))
-        using (var soft = new Bitmap(Math.Max(1, src.Width / 4), Math.Max(1, src.Height / 4)))
-        {
-            attrs.SetColorMatrix(new ColorMatrix(m));
-            attrs.SetWrapMode(WrapMode.TileFlipXY); // evita bordes oscuros al escalar
-            using (var g = Graphics.FromImage(mid))
-            {
-                g.InterpolationMode = InterpolationMode.HighQualityBilinear;
-                g.DrawImage(src, new Rectangle(0, 0, mid.Width, mid.Height), 0, 0, src.Width, src.Height, GraphicsUnit.Pixel, attrs);
-            }
-            using (var plain = new ImageAttributes())
-            {
-                plain.SetWrapMode(WrapMode.TileFlipXY);
-                using (var g = Graphics.FromImage(tiny))
-                {
-                    g.InterpolationMode = InterpolationMode.HighQualityBilinear;
-                    g.DrawImage(mid, new Rectangle(0, 0, tiny.Width, tiny.Height), 0, 0, mid.Width, mid.Height, GraphicsUnit.Pixel, plain);
-                }
-                // Se amplía en dos pasos: de golpe quedarían manchas cuadradas.
-                using (var g = Graphics.FromImage(soft))
-                {
-                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                    g.DrawImage(tiny, new Rectangle(0, 0, soft.Width, soft.Height), 0, 0, tiny.Width, tiny.Height, GraphicsUnit.Pixel, plain);
-                }
-                var result = new Bitmap(src.Width, src.Height, PixelFormat.Format32bppArgb);
-                using (var g = Graphics.FromImage(result))
-                {
-                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                    g.DrawImage(soft, new Rectangle(0, 0, result.Width, result.Height), 0, 0, soft.Width, soft.Height, GraphicsUnit.Pixel, plain);
-                }
-                return result;
-            }
-        }
     }
 
     // --- Dibujo --------------------------------------------------------------------------
@@ -1204,56 +1431,65 @@ class RadialMenu : Form
     void Render()
     {
         if (!IsHandleCreated) return;
-        if (frame == null || frame.Size != Size)
+        if (surface == null || surface.Bitmap.Size != Size)
         {
             DisposeFrames();
-            frame = new Bitmap(Width, Height, PixelFormat.Format32bppPArgb);
+            surface = new Native.LayeredSurface(Width, Height);
             scene = new Bitmap(Width, Height, PixelFormat.Format32bppPArgb);
+            sceneDirty = true;
         }
 
-        using (var g = Graphics.FromImage(frame))
+        // La opacidad (fundido de entrada y salida) la pone Windows a toda la ventana.
+        float a = revealed ? (float)Math.Max(0, Math.Min(1, appear.Value)) : 1f;
+        byte opacity = (byte)Math.Max(1, Math.Min(255, Math.Round(255 * a)));
+        using (var g = Graphics.FromImage(surface.Bitmap))
         {
+            g.CompositingMode = CompositingMode.SourceCopy;
             g.Clear(Color.Transparent);
+            g.CompositingMode = CompositingMode.SourceOver;
             // Disco casi invisible a tamaño completo: mantiene el arrastre "enganchado" a la ventana
-            // aunque el menú visible esté a mitad de su animación de entrada.
-            using (var b = new SolidBrush(Color.FromArgb(1, 255, 255, 255)))
+            // aunque el menú visible esté a mitad de su animación de entrada. Se compensa la opacidad de la ventana
+            // para que siga siendo mínima pero no cero (con cero, el arrastre pasaría a la ventana de detrás).
+            int diskAlpha = Math.Min(255, (255 + opacity - 1) / opacity);
+            using (var b = new SolidBrush(Color.FromArgb(diskAlpha, 255, 255, 255)))
                 g.FillEllipse(b, pad, pad, outerR * 2, outerR * 2);
 
             if (revealed)
             {
-                float a = (float)Math.Max(0, Math.Min(1, appear.Value));
                 float k = look.Motion ? 0.86f + 0.14f * a : 1f;
-                if (a > 0.995f && k > 0.995f)
+                if (k > 0.995f)
                 {
                     // Ya a tamaño completo (lo normal al mover el ratón): se dibuja directamente.
                     DrawScene(g);
                 }
                 else
                 {
-                    // Se materializa desde el cursor: escala + opacidad. Con animaciones desactivadas, solo fundido.
-                    using (var sg = Graphics.FromImage(scene))
+                    // Se materializa desde el cursor: la escena se dibuja una vez y en cada fotograma solo se escala.
+                    if (sceneDirty || !labelsIn.Settled || hovers.Any(h => !h.Settled))
                     {
-                        sg.Clear(Color.Transparent);
-                        DrawScene(sg);
+                        using (var sg = Graphics.FromImage(scene))
+                        {
+                            sg.CompositingMode = CompositingMode.SourceCopy;
+                            sg.Clear(Color.Transparent);
+                            sg.CompositingMode = CompositingMode.SourceOver;
+                            DrawScene(sg);
+                        }
+                        sceneDirty = false;
                     }
                     g.TranslateTransform(center, center);
                     g.ScaleTransform(k, k);
                     g.TranslateTransform(-center, -center);
                     g.InterpolationMode = InterpolationMode.Bilinear;
-                    using (var attrs = new ImageAttributes())
-                    {
-                        attrs.SetColorMatrix(new ColorMatrix { Matrix33 = a });
-                        g.DrawImage(scene, new Rectangle(0, 0, Width, Height), 0, 0, Width, Height, GraphicsUnit.Pixel, attrs);
-                    }
+                    g.DrawImage(scene, 0, 0, Width, Height);
                 }
             }
         }
-        Native.ApplyLayeredBitmap(this, frame);
+        surface.Present(this, opacity);
     }
 
     void DisposeFrames()
     {
-        if (frame != null) { frame.Dispose(); frame = null; }
+        if (surface != null) { surface.Dispose(); surface = null; }
         if (scene != null) { scene.Dispose(); scene = null; }
     }
 
@@ -1263,6 +1499,11 @@ class RadialMenu : Form
         if (baseLayer != null) { baseLayer.Dispose(); baseLayer = null; }
         if (labelPaths != null) foreach (var p in labelPaths) if (p != null) p.Dispose();
         labelPaths = null;
+        if (labelImages != null) foreach (var b in labelImages) if (b != null) b.Dispose();
+        labelImages = null;
+        if (centerImage != null) { centerImage.Dispose(); centerImage = null; }
+        centerKey = null;
+        sceneDirty = true;
     }
 
     float Sweep { get { return actions.Count > 0 ? 360f / actions.Count : 360f; } }
@@ -1402,43 +1643,89 @@ class RadialMenu : Form
         }
 
         // Etiquetas. Al cambiar de página emergen desde el centro (apuntan hacia donde va el gesto).
+        // En reposo (lo normal) se copian ya dibujadas: los halos son lo más caro de cada fotograma.
         float li = (float)Math.Max(0, Math.Min(1, labelsIn.Value));
-        float r = (outerR + innerR) / 2f;
+        if (labelImages == null) BuildLabelImages();
         for (int i = 0; i < n; i++)
         {
             float hv = (float)Math.Max(0, Math.Min(1, hovers[i].Value));
-            double mid = MidAngle(i);
-            float shift = 3 * scale * hv - 14 * scale * (1 - li);
-            float dx = (float)Math.Cos(mid) * shift, dy = (float)Math.Sin(mid) * shift;
-            // Cada etiqueta usa el color que contrasta con lo que tiene justo detrás.
-            Color text, halo;
-            Vibrancy(labelLight[i], out text, out halo);
-            var color = Lerp(text, look.OnAccent, hv);
-            color = Color.FromArgb((int)(color.A * li), color);
-            float haloK = li * Math.Max(0, 1 - hv * 2);   // sobre el color de acento no hace falta halo
-
-            var state = g.Save();
-            g.TranslateTransform(dx, dy);
-            if (haloK > 0.01f) DrawHalo(g, labelPaths[i], halo, haloK);
-            using (var brush = new SolidBrush(color)) g.FillPath(brush, labelPaths[i]);
-            g.Restore(state);
-
-            if (actions[i].Icon != null)
-            {
-                var c = new PointF(center + (float)Math.Cos(mid) * r + dx, center + (float)Math.Sin(mid) * r + dy);
-                var iconPos = new PointF(c.X, c.Y - 9 * scale);
-                if (haloK > 0.01f)
-                {
-                    Icons.Draw(g, actions[i].Icon, iconPos, 20 * scale, Color.FromArgb((int)(halo.A * haloK * 0.35f), halo), 4.2f);
-                    Icons.Draw(g, actions[i].Icon, iconPos, 20 * scale, Color.FromArgb((int)(halo.A * haloK), halo), 2.4f);
-                }
-                Icons.Draw(g, actions[i].Icon, iconPos, 20 * scale, color, 1f);
-            }
+            if (hv < 0.01f && li > 0.999f && labelImages[i] != null) g.DrawImageUnscaled(labelImages[i], labelOrigins[i]);
+            else DrawLabel(g, i, hv, li);
         }
 
         // Centro: superficie con la jerarquía de texto (principal + secundario).
         using (var cb = new SolidBrush(look.Center)) g.FillEllipse(cb, inner);
         using (var edge = new Pen(look.Separator, 1f * scale)) g.DrawEllipse(edge, inner);
+        DrawCenterText(g, inner, n);
+    }
+
+    void DrawLabel(Graphics g, int i, float hv, float li)
+    {
+        float r = (outerR + innerR) / 2f;
+        double mid = MidAngle(i);
+        float shift = 3 * scale * hv - 14 * scale * (1 - li);
+        float dx = (float)Math.Cos(mid) * shift, dy = (float)Math.Sin(mid) * shift;
+        // Cada etiqueta usa el color que contrasta con lo que tiene justo detrás.
+        Color text, halo;
+        Vibrancy(labelLight[i], out text, out halo);
+        var color = Lerp(text, look.OnAccent, hv);
+        color = Color.FromArgb((int)(color.A * li), color);
+        float haloK = li * Math.Max(0, 1 - hv * 2);   // sobre el color de acento no hace falta halo
+
+        var state = g.Save();
+        g.TranslateTransform(dx, dy);
+        if (haloK > 0.01f) DrawHalo(g, labelPaths[i], halo, haloK);
+        using (var brush = new SolidBrush(color)) g.FillPath(brush, labelPaths[i]);
+        g.Restore(state);
+
+        if (actions[i].Icon != null)
+        {
+            var c = new PointF(center + (float)Math.Cos(mid) * r + dx, center + (float)Math.Sin(mid) * r + dy);
+            var iconPos = new PointF(c.X, c.Y - 9 * scale);
+            if (haloK > 0.01f)
+            {
+                Icons.Draw(g, actions[i].Icon, iconPos, 20 * scale, Color.FromArgb((int)(halo.A * haloK * 0.35f), halo), 4.2f);
+                Icons.Draw(g, actions[i].Icon, iconPos, 20 * scale, Color.FromArgb((int)(halo.A * haloK), halo), 2.4f);
+            }
+            Icons.Draw(g, actions[i].Icon, iconPos, 20 * scale, color, 1f);
+        }
+    }
+
+    // Cada etiqueta en reposo, en un bitmap del tamaño justo (texto, icono y halo).
+    void BuildLabelImages()
+    {
+        int n = actions.Count;
+        labelImages = new Bitmap[n];
+        labelOrigins = new Point[n];
+        float r = (outerR + innerR) / 2f;
+        for (int i = 0; i < n; i++)
+        {
+            var box = labelPaths[i].GetBounds();
+            if (actions[i].Icon != null)
+            {
+                double mid = MidAngle(i);
+                var c = new PointF(center + (float)Math.Cos(mid) * r, center + (float)Math.Sin(mid) * r - 9 * scale);
+                box = RectangleF.Union(box, new RectangleF(c.X - 12 * scale, c.Y - 12 * scale, 24 * scale, 24 * scale));
+            }
+            var area = Rectangle.Round(RectangleF.Inflate(box, 10 * scale, 10 * scale));
+            area.Intersect(new Rectangle(0, 0, Width, Height));
+            if (area.Width <= 0 || area.Height <= 0) continue;
+            var bmp = new Bitmap(area.Width, area.Height, PixelFormat.Format32bppPArgb);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.TranslateTransform(-area.X, -area.Y);
+                DrawLabel(g, i, 0, 1);
+            }
+            labelImages[i] = bmp;
+            labelOrigins[i] = area.Location;
+        }
+    }
+
+    // Textos del centro: solo se redibujan (con sus halos) cuando cambian.
+    void DrawCenterText(Graphics g, RectangleF inner, int n)
+    {
 
         string name = files.Count == 1 ? Shorten(Path.GetFileName(files[0])) : files.Count + " archivos";
         string primary, secondary;
@@ -1446,25 +1733,42 @@ class RadialMenu : Form
         else if (hover >= 0) { primary = actions[hover].Description; secondary = name; }
         else { primary = name; secondary = sizeText ?? (dragMode ? "Suelta en una opción" : holdMode ? "Suelta Shift en una opción" : "Elige una opción"); }
 
-        var textBox = RectangleF.Inflate(inner, -12 * scale, -14 * scale);
-        float gap = 2 * scale;
-        var top = new RectangleF(textBox.X, textBox.Y, textBox.Width, textBox.Height / 2 + 6 * scale - gap);
-        var bottom = new RectangleF(textBox.X, textBox.Y + textBox.Height / 2 + 6 * scale + gap, textBox.Width, textBox.Height / 2 - 6 * scale);
-        if (secondary.Length == 0) top = textBox;
-
-        Color ctext, chalo;
-        Vibrancy(centerLight, out ctext, out chalo);
-        var csecondary = Color.FromArgb(ctext.A * 2 / 3, ctext);
-        using (var p1 = new GraphicsPath())
-        using (var p2 = new GraphicsPath())
+        string key = primary + "\n" + secondary;
+        if (centerImage == null || centerKey != key)
         {
-            p1.AddString(primary, labelFont, (int)FontStyle.Regular, 12.5f * scale, top, secondary.Length == 0 ? centered : above);
-            if (secondary.Length > 0) p2.AddString(secondary, textFont, (int)FontStyle.Regular, 11f * scale, bottom, below);
-            DrawHalo(g, p1, chalo, 0.8f);
-            DrawHalo(g, p2, chalo, 0.6f);
-            using (var b1 = new SolidBrush(ctext)) g.FillPath(b1, p1);
-            using (var b2 = new SolidBrush(csecondary)) g.FillPath(b2, p2);
+            if (centerImage != null) centerImage.Dispose();
+            var area = Rectangle.Round(RectangleF.Inflate(inner, 4 * scale, 4 * scale));
+            centerImage = new Bitmap(area.Width, area.Height, PixelFormat.Format32bppPArgb);
+            centerOrigin = area.Location;
+            centerKey = key;
+            using (var cg = Graphics.FromImage(centerImage))
+            {
+                cg.SmoothingMode = SmoothingMode.AntiAlias;
+                cg.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                cg.TranslateTransform(-area.X, -area.Y);
+
+                var textBox = RectangleF.Inflate(inner, -12 * scale, -14 * scale);
+                float gap = 2 * scale;
+                var top = new RectangleF(textBox.X, textBox.Y, textBox.Width, textBox.Height / 2 + 6 * scale - gap);
+                var bottom = new RectangleF(textBox.X, textBox.Y + textBox.Height / 2 + 6 * scale + gap, textBox.Width, textBox.Height / 2 - 6 * scale);
+                if (secondary.Length == 0) top = textBox;
+
+                Color ctext, chalo;
+                Vibrancy(centerLight, out ctext, out chalo);
+                var csecondary = Color.FromArgb(ctext.A * 2 / 3, ctext);
+                using (var p1 = new GraphicsPath())
+                using (var p2 = new GraphicsPath())
+                {
+                    p1.AddString(primary, labelFont, (int)FontStyle.Regular, 12.5f * scale, top, secondary.Length == 0 ? centered : above);
+                    if (secondary.Length > 0) p2.AddString(secondary, textFont, (int)FontStyle.Regular, 11f * scale, bottom, below);
+                    DrawHalo(cg, p1, chalo, 0.8f);
+                    DrawHalo(cg, p2, chalo, 0.6f);
+                    using (var b1 = new SolidBrush(ctext)) cg.FillPath(b1, p1);
+                    using (var b2 = new SolidBrush(csecondary)) cg.FillPath(b2, p2);
+                }
+            }
         }
+        g.DrawImageUnscaled(centerImage, centerOrigin);
     }
 
     // Texto claro sobre fondos oscuros y oscuro sobre fondos claros, cada uno con su halo contrario.
@@ -1486,17 +1790,17 @@ class RadialMenu : Form
     // Luminosidad media (0..1) del fondo en una zona; sin fondo capturado, la del tema.
     double RegionLuminance(RectangleF r)
     {
-        if (backdrop == null) return look.Dark ? 0.1 : 0.9;
+        var b = backdropSmall;
+        if (b == null) return look.Dark ? 0.1 : 0.9;
         double sum = 0;
         int count = 0;
         for (int iy = 0; iy < 5; iy++)
         {
             for (int ix = 0; ix < 7; ix++)
             {
-                int x = (int)(r.X + r.Width * (ix + 0.5f) / 7), y = (int)(r.Y + r.Height * (iy + 0.5f) / 5);
-                if (x < 0 || y < 0 || x >= backdrop.Width || y >= backdrop.Height) continue;
-                var c = backdrop.GetPixel(x, y);
-                sum += (0.2126 * c.R + 0.7152 * c.G + 0.0722 * c.B) / 255;
+                int x = (int)((r.X + r.Width * (ix + 0.5f) / 7) / Backdrop.Factor), y = (int)((r.Y + r.Height * (iy + 0.5f) / 5) / Backdrop.Factor);
+                if (x < 0 || y < 0 || x >= b.Width || y >= b.Height) continue;
+                sum += Backdrop.Lum(b.Pixels[y * b.Width + x]);
                 count++;
             }
         }

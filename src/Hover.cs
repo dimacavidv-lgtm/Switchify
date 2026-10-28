@@ -16,6 +16,17 @@ static class HoverFiles
     [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd, int flags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder name, int max);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindow(string cls, string title);
+
+    // ¿Hay bajo el punto una ventana donde puede haber archivos (Escritorio o Explorador)? Es inmediato.
+    public static bool IsFileWindowAt(int x, int y)
+    {
+        IntPtr root = GetAncestor(WindowFromPoint(new POINT { X = x, Y = y }), 2);   // GA_ROOT
+        var cls = new StringBuilder(64);
+        GetClassName(root, cls, cls.Capacity);
+        string c = cls.ToString();
+        return c == "Progman" || c == "WorkerW" || c == "CabinetWClass";
+    }
 
     // Debe llamarse en un hilo STA (el objeto Shell.Application es COM de un solo hilo).
     public static List<string> Get(int x, int y)
@@ -70,7 +81,9 @@ static class HoverFiles
     }
 
     // La primera consulta de accesibilidad de un proceso es lenta (carga y conecta todo): se hace al arrancar,
-    // en segundo plano, para que el primer toque de Shift responda igual de rápido que los demás.
+    // en segundo plano, para que el primer toque de Shift responda igual de rápido que los demás. No basta con
+    // preguntar por cualquier punto: hay que llegar hasta un icono del Explorador (el Escritorio), que es lo que
+    // carga la conexión con su proceso, y recorrer sus ventanas abiertas.
     public static void Warm()
     {
         var thread = new System.Threading.Thread(() =>
@@ -79,7 +92,20 @@ static class HoverFiles
             {
                 var root = AutomationElement.RootElement;
                 AutomationElement.FromPoint(new System.Windows.Point(0, 0));
-                Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application"));
+                IntPtr desktop = FindWindow("Progman", null);
+                if (desktop != IntPtr.Zero)
+                {
+                    var item = AutomationElement.FromHandle(desktop).FindFirst(TreeScope.Descendants,
+                        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem));
+                    if (item != null)
+                    {
+                        var name = item.Current.Name;
+                        TreeWalker.ControlViewWalker.GetParent(item);
+                    }
+                }
+                dynamic shell = Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application"));
+                foreach (dynamic window in shell.Windows()) { try { var hwnd = window.HWND; } catch { } }
+                shell.NameSpace(0).Items().Count.ToString();
             }
             catch { }
         });
