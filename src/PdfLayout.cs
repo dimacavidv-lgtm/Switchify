@@ -564,34 +564,9 @@ static class DocumentPdf
     {
         lock (Gate)
         {
-            using (var doc = new PrintDocument())
-            {
-                doc.PrinterSettings.PrinterName = PdfPrinter;
-                doc.PrinterSettings.PrintToFile = true;
-                doc.PrinterSettings.PrintFileName = output;
-                doc.PrintController = new StandardPrintController();   // sin diálogos
-                doc.DocumentName = Path.GetFileNameWithoutExtension(output);
-                var a4 = doc.PrinterSettings.PaperSizes.Cast<PaperSize>().FirstOrDefault(p => p.Kind == PaperKind.A4);
-                if (a4 != null) doc.DefaultPageSettings.PaperSize = a4;
-                doc.DefaultPageSettings.Landscape = false;
-                doc.DefaultPageSettings.Margins = new Margins(0, 0, 0, 0);
-
-                int index = 0;
-                doc.PrintPage += (s, e) =>
-                {
-                    var g = e.Graphics;
-                    g.PageUnit = GraphicsUnit.Point;
-                    // El origen está en la zona imprimible: se lleva a la esquina del papel.
-                    g.TranslateTransform(-e.PageSettings.HardMarginX * 0.72f, -e.PageSettings.HardMarginY * 0.72f);
-                    g.SmoothingMode = SmoothingMode.AntiAlias;
-                    g.TextRenderingHint = TextRenderingHint.AntiAlias;
-                    foreach (var op in layout.Pages[index]) op(g);
-                    index++;
-                    e.HasMorePages = index < layout.Pages.Count;
-                };
-                if (File.Exists(output)) File.Delete(output);
-                doc.Print();
-            }
+            var settings = new PrinterSettings { PrinterName = PdfPrinter, PrintToFile = true, PrintFileName = output };
+            if (File.Exists(output)) File.Delete(output);
+            PrintOps.PrintLayout(layout, settings, Path.GetFileNameWithoutExtension(output));
             WaitForFile(output);
         }
     }

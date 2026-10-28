@@ -103,6 +103,14 @@ static class Documents
         return output;
     }
 
+    // Bloques de cualquier documento (para imprimirlo). El HTML se lee sin CSS.
+    public static List<Block> LoadBlocks(string path)
+    {
+        string ext = Path.GetExtension(path).ToLowerInvariant();
+        if (ext == ".html" || ext == ".htm") return HtmlReader.Read(File.ReadAllText(path));
+        return Read(path);
+    }
+
     static List<Block> Read(string path)
     {
         switch (Path.GetExtension(path).ToLowerInvariant())
@@ -918,6 +926,23 @@ static class Pdf
             stream.Seek(0);
             return stream;
         }
+    }
+
+    // Para imprimir: abrir un PDF, saber cuántas páginas y de qué tamaño tiene, y dibujar una página.
+    public static PdfDocument OpenDocument(string path) { return Open(path); }
+    public static int PageCount(PdfDocument doc) { return (int)doc.PageCount; }
+
+    public static SizeF PageSize(PdfDocument doc, int index)
+    {
+        using (var page = doc.GetPage((uint)index)) return new SizeF((float)page.Size.Width, (float)page.Size.Height);
+    }
+
+    public static Bitmap RenderPage(PdfDocument doc, int index, double scale)
+    {
+        using (var stream = Render(doc, (uint)index, scale))
+        using (var ms = new MemoryStream(WinRt.ReadAll(stream)))
+        using (var decoded = new Bitmap(ms))
+            return new Bitmap(decoded);   // copia: así no depende del MemoryStream
     }
 
     // Guarda cada página como imagen. Devuelve la ruta de la primera.

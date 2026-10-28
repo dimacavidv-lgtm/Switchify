@@ -883,6 +883,17 @@ class RadialMenu : Form
 
     void Execute(FileAction action, List<string> targets)
     {
+        if (action.OpenBatch != null)
+        {
+            // Como las herramientas con ventana, pero con todos los archivos (un solo cuadro de impresión).
+            if (Visible) Finish();
+            BeginInvoke(new Action(() =>
+            {
+                try { action.OpenBatch(targets); }
+                catch (Exception ex) { if (ActionFinished != null) ActionFinished("Switchify – error", ex.Message, true); }
+            }));
+            return;
+        }
         if (action.Open != null)
         {
             // Herramientas con ventana: el menú se quita al instante (la ventana nueva es la transición)
@@ -1386,6 +1397,7 @@ class FileAction
     public Func<string, string> Run;               // un archivo -> ruta de salida
     public Func<List<string>, string> RunBatch;    // todos los archivos a la vez -> ruta de salida
     public Action<string> Open;                    // abre una ventana de herramienta (hilo de la interfaz)
+    public Action<List<string>> OpenBatch;         // igual, pero con todos los archivos a la vez (imprimir)
     public List<FileAction> SubActions;            // otra página del anillo
     public string Icon;                            // símbolo dibujado sobre la etiqueta (ver Icons)
     public bool Slow;                              // tarda (vídeo, audio): se avisa al empezar
@@ -1444,6 +1456,13 @@ static class Icons
                 case "crop":
                     g.DrawLines(pen, new[] { P(6, 2), P(6, 14), P(18, 14) });
                     g.DrawLines(pen, new[] { P(2, 6), P(14, 6), P(14, 18) });
+                    break;
+                case "printer":
+                    // Cuerpo de la impresora, hoja que entra por arriba y hoja impresa que sale por abajo.
+                    g.DrawLines(pen, new[] { P(6, 7), P(6, 2.5f), P(14, 2.5f), P(14, 7) });
+                    using (var path = Shapes.Rounded(Rc(2.5f, 7, 15, 7.5f), 1.8f * u)) g.DrawPath(pen, path);
+                    g.DrawPolygon(pen, new[] { P(6, 12), P(14, 12), P(14, 17.5f), P(6, 17.5f) });
+                    g.FillEllipse(fill, Rc(14.2f, 8.6f, 1.6f, 1.6f));
                     break;
                 case "eyeslash":
                     using (var path = new GraphicsPath())
@@ -1574,6 +1593,10 @@ static class FileActions
                 list.Add(new FileAction { Label = fmt[0], Description = "Convertir a " + fmt[0], Run = f => Documents.Convert(f, ext) });
             }
         }
+
+        // Imprimir: imágenes, documentos, PDF y lo que el programa asociado sepa imprimir (no vídeo, audio ni ZIP).
+        if (files.All(PrintOps.CanPrint))
+            list.Add(new FileAction { Label = "Imprimir", Description = "Imprimir…", Icon = "printer", OpenBatch = PrintOps.PrintFiles });
 
         if (files.All(f => File.Exists(f) && Path.GetExtension(f).ToLowerInvariant() == ".zip"))
             list.Add(new FileAction { Label = "Extraer", Description = "Extraer ZIP", Run = ArchiveOps.Extract });
