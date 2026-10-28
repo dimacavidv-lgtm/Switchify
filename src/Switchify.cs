@@ -36,7 +36,7 @@ static class Program
 
 static class Native
 {
-    public const int WH_KEYBOARD_LL = 13;
+    public const int WH_KEYBOARD_LL = 13, WH_MOUSE_LL = 14;
     public const int WM_KEYDOWN = 0x100, WM_KEYUP = 0x101, WM_SYSKEYDOWN = 0x104, WM_SYSKEYUP = 0x105;
     public const int WM_HOTKEY = 0x312;
     public const int VK_LBUTTON = 0x01, VK_SHIFT = 0x10, VK_LSHIFT = 0xA0, VK_RSHIFT = 0xA1, VK_SPACE = 0x20;
@@ -56,6 +56,27 @@ static class Native
     [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern int GetWindowThreadProcessId(IntPtr hWnd, IntPtr pid);
+    [DllImport("kernel32.dll")] static extern int GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(int idAttach, int idAttachTo, bool attach);
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr hWnd);
+
+    // Trae la ventana al frente con el foco aunque otro programa (el Explorador) sea el activo: Windows solo lo
+    // permite si el hilo comparte la entrada con el de la ventana activa durante un instante.
+    public static void ForceForeground(IntPtr hwnd)
+    {
+        int target = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero), self = GetCurrentThreadId();
+        bool attached = target != 0 && target != self && AttachThreadInput(self, target, true);
+        try
+        {
+            BringWindowToTop(hwnd);
+            SetForegroundWindow(hwnd);
+        }
+        finally
+        {
+            if (attached) AttachThreadInput(self, target, false);
+        }
+    }
 
     [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] struct SIZE { public int CX, CY; }
@@ -99,6 +120,13 @@ static class Native
         int vk = SystemInformation.MouseButtonsSwapped ? 0x02 : VK_LBUTTON;
         return (GetAsyncKeyState(vk) & 0x8000) != 0;
     }
+
+    public static bool AnyButtonDown()
+    {
+        foreach (int vk in new[] { 0x01, 0x02, 0x04, 0x05, 0x06 })   // izquierdo, derecho, central, X1, X2
+            if ((GetAsyncKeyState(vk) & 0x8000) != 0) return true;
+        return false;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -112,9 +140,13 @@ class TrayContext : ApplicationContext
     readonly NotifyIcon tray;
     readonly RadialMenu menu;
     readonly HotkeyWindow hotkey;
-    readonly Native.LowLevelKeyboardProc hookProc; // referencia viva para que el GC no la recoja
-    IntPtr hookHandle;
-    bool shiftHeld;
+    readonly Native.LowLevelKeyboardProc hookProc, mouseProc; // referencias vivas para que el GC no las recoja
+    IntPtr hookHandle, mouseHandle;
+    // Shift: «arrastrar + Shift» se dispara al pulsar con el botón apretado; «ratón encima + Shift», con un
+    // toque de Shift solo (pulsar y soltar rápido, sin otra tecla ni clic entremedias).
+    bool shiftHeld, shiftWithOther, shiftForDrag;
+    readonly Stopwatch shiftClock = new Stopwatch();
+    bool hoverBusy;
 
     public TrayContext()
     {
@@ -160,8 +192,9 @@ class TrayContext : ApplicationContext
 
         hookProc = KeyboardHook;
         hookHandle = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, hookProc, Native.GetModuleHandle(null), 0);
-
-        tray.ShowBalloonTip(3000, "Switchify está activo", "Arrastra un archivo y pulsa Shift, o selecciona archivos y pulsa Ctrl+Shift+Espacio.", ToolTipIcon.Info);
+        mouseProc = MouseHook;
+        mouseHandle = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, mouseProc, Native.GetModuleHandle(null), 0);
+        HoverFiles.Warm();
     }
 
     IntPtr KeyboardHook(int nCode, IntPtr wParam, IntPtr lParam)
@@ -171,19 +204,68 @@ class TrayContext : ApplicationContext
             int msg = wParam.ToInt32();
             int vk = Marshal.ReadInt32(lParam);
             bool isShift = vk == Native.VK_LSHIFT || vk == Native.VK_RSHIFT || vk == Native.VK_SHIFT;
-            if (isShift && (msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN))
+            bool down = msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN;
+            bool up = msg == Native.WM_KEYUP || msg == Native.WM_SYSKEYUP;
+            if (isShift && down)
             {
-                // Solo en la pulsación inicial (no en la auto-repetición) y con el botón izquierdo apretado.
-                if (!shiftHeld && Native.LeftButtonDown())
-                    menu.BeginInvoke(new Action(menu.ShowForDrag));
-                shiftHeld = true;
+                // Solo en la pulsación inicial (no en la auto-repetición).
+                if (!shiftHeld)
+                {
+                    shiftHeld = true;
+                    shiftWithOther = false;
+                    shiftForDrag = Native.LeftButtonDown();
+                    shiftClock.Restart();
+                    if (shiftForDrag) menu.BeginInvoke(new Action(menu.ShowForDrag));
+                }
             }
-            else if (isShift && (msg == Native.WM_KEYUP || msg == Native.WM_SYSKEYUP))
+            else if (isShift && up)
             {
+                // Toque de Shift solo, con el ratón quieto: el anillo para el archivo que haya bajo el cursor.
+                if (shiftHeld && !shiftWithOther && !shiftForDrag && shiftClock.ElapsedMilliseconds < 500 && !Native.AnyButtonDown())
+                {
+                    var p = Cursor.Position;
+                    menu.BeginInvoke(new Action(() => ShowForHover(p)));
+                }
                 shiftHeld = false;
+            }
+            else if (down && shiftHeld)
+            {
+                shiftWithOther = true;   // Shift + otra tecla (mayúsculas, atajos): no es un toque
             }
         }
         return Native.CallNextHookEx(hookHandle, nCode, wParam, lParam);
+    }
+
+    // Un clic o la rueda mientras Shift está pulsado (Shift+clic para seleccionar) anulan el toque.
+    IntPtr MouseHook(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && shiftHeld)
+        {
+            int msg = wParam.ToInt32();
+            if (msg == 0x201 || msg == 0x204 || msg == 0x207 || msg == 0x20A || msg == 0x20B || msg == 0x20E) shiftWithOther = true;
+        }
+        return Native.CallNextHookEx(mouseHandle, nCode, wParam, lParam);
+    }
+
+    // Busca el archivo bajo el cursor en un hilo aparte (STA, para el Explorador) y abre el anillo si lo hay.
+    void ShowForHover(Point p)
+    {
+        if (hoverBusy || menu.Visible) return;
+        hoverBusy = true;
+        var thread = new Thread(() =>
+        {
+            List<string> files;
+            try { files = HoverFiles.Get(p.X, p.Y); }
+            catch { files = new List<string>(); }
+            menu.BeginInvoke(new Action(() =>
+            {
+                hoverBusy = false;
+                if (files.Count > 0 && !menu.Visible) menu.ShowForFiles(files);
+            }));
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.IsBackground = true;
+        thread.Start();
     }
 
     void OnHotkey()
@@ -207,7 +289,9 @@ class TrayContext : ApplicationContext
         MessageBox.Show(
             "1) Arrastra un archivo (desde el Escritorio o el Explorador) y, sin soltarlo, pulsa Shift.\n" +
             "   Aparece el menú circular: suelta el archivo sobre la opción que quieras.\n\n" +
-            "2) O selecciona archivos en el Explorador y pulsa Ctrl+Shift+Espacio, luego haz clic en una opción.\n\n" +
+            "2) O deja el ratón encima de un archivo y da un toque a Shift (pulsar y soltar), luego haz clic en una opción.\n" +
+            "   Si el archivo está dentro de una selección, se usan todos los seleccionados.\n\n" +
+            "3) O selecciona archivos en el Explorador y pulsa Ctrl+Shift+Espacio.\n\n" +
             "El resultado se guarda junto al archivo original (nunca se sobrescribe).\n" +
             "Suelta en el centro o pulsa Esc para cancelar.",
             "Switchify", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -296,6 +380,7 @@ class TrayContext : ApplicationContext
     protected override void ExitThreadCore()
     {
         if (hookHandle != IntPtr.Zero) Native.UnhookWindowsHookEx(hookHandle);
+        if (mouseHandle != IntPtr.Zero) Native.UnhookWindowsHookEx(mouseHandle);
         hotkey.Dispose();
         tray.Visible = false;
         tray.Dispose();
@@ -549,7 +634,9 @@ class RadialMenu : Form
 
     readonly float scale;
     readonly int outerR, innerR, pad, center;
-    readonly System.Windows.Forms.Timer releaseTimer, frameTimer, dwellTimer;
+    readonly System.Windows.Forms.Timer releaseTimer, frameTimer, dwellTimer, outsideWatch;
+    bool showing;                                       // dentro de ShowForFiles (ver OnDeactivate)
+    readonly Stopwatch shownClock = new Stopwatch();
     readonly Stopwatch clock = new Stopwatch();
     readonly Spring appear = new Spring(1.0, 0.32);   // entrada/salida: sin rebote
     readonly Spring labelsIn = new Spring(1.0, 0.3);  // las etiquetas emergen al cambiar de página
@@ -599,6 +686,14 @@ class RadialMenu : Form
         {
             // En modo arrastre el menú vive mientras el botón siga apretado.
             if (dragMode && !Native.LeftButtonDown()) HideMenu();
+        };
+
+        // Respaldo por si Windows no le dio el foco: un clic fuera del anillo también lo cierra.
+        outsideWatch = new System.Windows.Forms.Timer { Interval = 40 };
+        outsideWatch.Tick += delegate
+        {
+            if (!Visible || dragMode || closing) { outsideWatch.Stop(); return; }
+            if (Native.AnyButtonDown() && !Bounds.Contains(Cursor.Position)) HideMenu();
         };
 
         frameTimer = new System.Windows.Forms.Timer { Interval = 8 };
@@ -680,12 +775,23 @@ class RadialMenu : Form
     public void ShowForFiles(List<string> selected)
     {
         dragMode = false;
-        Prepare(selected);
-        revealed = true;
-        Show();
-        Reveal();
-        Activate();
-        Native.SetForegroundWindow(Handle);
+        showing = true;
+        try
+        {
+            Prepare(selected);
+            revealed = true;
+            Show();
+            Reveal();
+            // Con el foco: así Esc y un clic fuera lo cierran (con el toque de Shift, el activo es el Explorador).
+            Native.ForceForeground(Handle);
+            Activate();
+        }
+        finally
+        {
+            showing = false;
+            shownClock.Restart();
+        }
+        outsideWatch.Start();
     }
 
     void Reveal()
@@ -711,6 +817,7 @@ class RadialMenu : Form
     {
         StopAnimation();
         dwellTimer.Stop();
+        outsideWatch.Stop();
         closing = false;
         revealed = false;
         Hide();
@@ -721,6 +828,9 @@ class RadialMenu : Form
     protected override void OnDeactivate(EventArgs e)
     {
         base.OnDeactivate(e);
+        // Al mostrarse, Windows puede activarlo y desactivarlo en el mismo instante (sobre todo la primera vez):
+        // eso no es un clic fuera, así que se ignora mientras se muestra y un momento después.
+        if (showing || shownClock.ElapsedMilliseconds < 300) return;
         if (!dragMode) HideMenu();
     }
 
