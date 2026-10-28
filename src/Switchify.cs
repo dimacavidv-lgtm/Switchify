@@ -143,9 +143,13 @@ class TrayContext : ApplicationContext
     readonly Native.LowLevelKeyboardProc hookProc, mouseProc; // referencias vivas para que el GC no las recoja
     IntPtr hookHandle, mouseHandle;
     // Shift: «arrastrar + Shift» se dispara al pulsar con el botón apretado; «ratón encima + Shift», con un
-    // toque de Shift solo (pulsar y soltar rápido, sin otra tecla ni clic entremedias).
-    bool shiftHeld, shiftWithOther, shiftForDrag;
+    // toque de Shift solo (pulsar y soltar rápido, sin otra tecla ni clic entremedias) o manteniéndolo
+    // con el ratón quieto (el anillo vive mientras Shift siga pulsado y al soltarlo se usa la opción de debajo).
+    const int HoldMs = 400;
+    bool shiftHeld, shiftWithOther, shiftForDrag, shiftMoved;
+    Point shiftStart;
     readonly Stopwatch shiftClock = new Stopwatch();
+    readonly System.Windows.Forms.Timer holdTimer = new System.Windows.Forms.Timer { Interval = HoldMs };
     bool hoverBusy;
 
     public TrayContext()
@@ -195,6 +199,15 @@ class TrayContext : ApplicationContext
         mouseProc = MouseHook;
         mouseHandle = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, mouseProc, Native.GetModuleHandle(null), 0);
         HoverFiles.Warm();
+
+        holdTimer.Tick += delegate
+        {
+            holdTimer.Stop();
+            var now = Cursor.Position;
+            if (Math.Abs(now.X - shiftStart.X) > 6 || Math.Abs(now.Y - shiftStart.Y) > 6) shiftMoved = true;
+            if (shiftHeld && !shiftWithOther && !shiftMoved && !shiftForDrag && !Native.AnyButtonDown())
+                ShowForHover(Cursor.Position, true);
+        };
     }
 
     IntPtr KeyboardHook(int nCode, IntPtr wParam, IntPtr lParam)
@@ -213,18 +226,24 @@ class TrayContext : ApplicationContext
                 {
                     shiftHeld = true;
                     shiftWithOther = false;
+                    shiftMoved = false;
+                    shiftStart = Cursor.Position;
                     shiftForDrag = Native.LeftButtonDown();
                     shiftClock.Restart();
                     if (shiftForDrag) menu.BeginInvoke(new Action(menu.ShowForDrag));
+                    else holdTimer.Start();
                 }
             }
             else if (isShift && up)
             {
+                holdTimer.Stop();
+                // Abierto manteniendo Shift: al soltarlo se usa la opción bajo el cursor (o se cierra).
+                if (menu.Holding) menu.BeginInvoke(new Action(menu.ReleaseHold));
                 // Toque de Shift solo, con el ratón quieto: el anillo para el archivo que haya bajo el cursor.
-                if (shiftHeld && !shiftWithOther && !shiftForDrag && shiftClock.ElapsedMilliseconds < 500 && !Native.AnyButtonDown())
+                else if (shiftHeld && !shiftWithOther && !shiftForDrag && shiftClock.ElapsedMilliseconds < HoldMs && !Native.AnyButtonDown())
                 {
                     var p = Cursor.Position;
-                    menu.BeginInvoke(new Action(() => ShowForHover(p)));
+                    menu.BeginInvoke(new Action(() => ShowForHover(p, false)));
                 }
                 shiftHeld = false;
             }
@@ -236,19 +255,25 @@ class TrayContext : ApplicationContext
         return Native.CallNextHookEx(hookHandle, nCode, wParam, lParam);
     }
 
-    // Un clic o la rueda mientras Shift está pulsado (Shift+clic para seleccionar) anulan el toque.
+    // Un clic o la rueda mientras Shift está pulsado (Shift+clic para seleccionar) anulan el toque; mover el
+    // ratón antes de que salga el anillo anula el modo mantenido (se estaría seleccionando).
     IntPtr MouseHook(int nCode, IntPtr wParam, IntPtr lParam)
     {
         if (nCode >= 0 && shiftHeld)
         {
             int msg = wParam.ToInt32();
             if (msg == 0x201 || msg == 0x204 || msg == 0x207 || msg == 0x20A || msg == 0x20B || msg == 0x20E) shiftWithOther = true;
+            if (msg == 0x200 && !shiftMoved)
+            {
+                int x = Marshal.ReadInt32(lParam), y = Marshal.ReadInt32(lParam, 4);
+                if (Math.Abs(x - shiftStart.X) > 6 || Math.Abs(y - shiftStart.Y) > 6) shiftMoved = true;
+            }
         }
         return Native.CallNextHookEx(mouseHandle, nCode, wParam, lParam);
     }
 
     // Busca el archivo bajo el cursor en un hilo aparte (STA, para el Explorador) y abre el anillo si lo hay.
-    void ShowForHover(Point p)
+    void ShowForHover(Point p, bool hold)
     {
         if (hoverBusy || menu.Visible) return;
         hoverBusy = true;
@@ -260,7 +285,8 @@ class TrayContext : ApplicationContext
             menu.BeginInvoke(new Action(() =>
             {
                 hoverBusy = false;
-                if (files.Count > 0 && !menu.Visible) menu.ShowForFiles(files);
+                // Si Shift se soltó mientras se buscaba el archivo, el modo mantenido ya no tiene sentido.
+                if (files.Count > 0 && !menu.Visible && (!hold || shiftHeld)) menu.ShowForFiles(files, hold);
             }));
         });
         thread.SetApartmentState(ApartmentState.STA);
@@ -276,7 +302,7 @@ class TrayContext : ApplicationContext
             tray.ShowBalloonTip(2500, "Switchify", "Selecciona uno o más archivos en el Explorador antes de pulsar Ctrl+Shift+Espacio.", ToolTipIcon.Info);
             return;
         }
-        menu.ShowForFiles(files);
+        menu.ShowForFiles(files, false);
     }
 
     void ShowResult(string title, string text, bool error)
@@ -290,6 +316,7 @@ class TrayContext : ApplicationContext
             "1) Arrastra un archivo (desde el Escritorio o el Explorador) y, sin soltarlo, pulsa Shift.\n" +
             "   Aparece el menú circular: suelta el archivo sobre la opción que quieras.\n\n" +
             "2) O deja el ratón encima de un archivo y da un toque a Shift (pulsar y soltar), luego haz clic en una opción.\n" +
+            "   También puedes mantener Shift: sale el anillo, mueve el ratón a una opción y suelta Shift.\n" +
             "   Si el archivo está dentro de una selección, se usan todos los seleccionados.\n\n" +
             "3) O selecciona archivos en el Explorador y pulsa Ctrl+Shift+Espacio.\n\n" +
             "El resultado se guarda junto al archivo original (nunca se sobrescribe).\n" +
@@ -658,7 +685,7 @@ class RadialMenu : Form
     int noDwell = -1;          // tras cambiar de página, la opción bajo el cursor no vuelve a cambiarla
     float angleOffset;         // giro del anillo para que "volver" quede donde estaba "Herramientas"
     string sizeText;           // tamaño del archivo, mostrado en el centro
-    bool dragMode, revealed, closing;
+    bool dragMode, holdMode, revealed, closing;   // holdMode: abierto manteniendo Shift (se elige al soltarlo)
 
     public RadialMenu()
     {
@@ -772,9 +799,12 @@ class RadialMenu : Form
         releaseTimer.Start();
     }
 
-    public void ShowForFiles(List<string> selected)
+    public bool Holding { get { return holdMode && Visible && !closing; } }
+
+    public void ShowForFiles(List<string> selected, bool hold)
     {
         dragMode = false;
+        holdMode = hold;
         showing = true;
         try
         {
@@ -801,10 +831,22 @@ class RadialMenu : Form
         StartAnimation();
     }
 
+    // Shift soltado en el modo mantenido: como soltar un arrastre, se usa la opción bajo el cursor.
+    public void ReleaseHold()
+    {
+        if (!Holding) return;
+        holdMode = false;
+        int chosen = HitTest(PointToClient(Cursor.Position));
+        var selected = files;
+        HideMenu();
+        if (chosen >= 0 && actions[chosen].SubActions == null) Execute(actions[chosen], selected);
+    }
+
     void HideMenu()
     {
         releaseTimer.Stop();
         dragMode = false;
+        holdMode = false;
         if (!Visible || closing) return;
         if (!revealed) { Finish(); return; }
         // Sale por el mismo camino por el que entró: se encoge hacia el cursor.
@@ -1402,7 +1444,7 @@ class RadialMenu : Form
         string primary, secondary;
         if (n == 0) { primary = "Switchify"; secondary = ""; }
         else if (hover >= 0) { primary = actions[hover].Description; secondary = name; }
-        else { primary = name; secondary = sizeText ?? (dragMode ? "Suelta en una opción" : "Elige una opción"); }
+        else { primary = name; secondary = sizeText ?? (dragMode ? "Suelta en una opción" : holdMode ? "Suelta Shift en una opción" : "Elige una opción"); }
 
         var textBox = RectangleF.Inflate(inner, -12 * scale, -14 * scale);
         float gap = 2 * scale;
