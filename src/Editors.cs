@@ -447,7 +447,7 @@ abstract class EditorForm : Form
         titleHeight = 40 * S;
 
         Text = title + " — " + Path.GetFileName(path);
-        Icon = Theme.MakeTrayIcon();
+        Icon = Theme.WindowIcon();
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
         intendedSize = new Size((int)(780 * S), (int)(560 * S + panelHeight + titleHeight));

@@ -147,7 +147,7 @@ class TrayContext : ApplicationContext
 
         tray = new NotifyIcon
         {
-            Icon = Theme.MakeTrayIcon(),
+            Icon = Theme.TrayIcon(),
             Text = "Switchify – arrastra + Shift o Ctrl+Shift+Espacio",
             ContextMenuStrip = strip,
             Visible = true
@@ -498,7 +498,30 @@ class Spring
 
 static class Theme
 {
-    public static Icon MakeTrayIcon()
+    // Icono del logo (la S de flechas), que build.ps1 incrusta como recurso "Switchify.ico" con todos sus tamaños.
+    static Icon Embedded(Size? size)
+    {
+        using (var stream = typeof(Theme).Assembly.GetManifestResourceStream("Switchify.ico"))
+        {
+            if (stream == null) return null;
+            return size.HasValue ? new Icon(stream, size.Value) : new Icon(stream);
+        }
+    }
+
+    // Bandeja: el tamaño pequeño que pide Windows según la escala de pantalla (16 px al 100 %, 24 al 150 %…).
+    public static Icon TrayIcon()
+    {
+        return Embedded(SystemInformation.SmallIconSize) ?? MakeTrayIcon();
+    }
+
+    // Ventanas: el icono completo; Windows elige el tamaño para la barra de tareas y Alt+Tab.
+    public static Icon WindowIcon()
+    {
+        return Embedded(null) ?? MakeTrayIcon();
+    }
+
+    // Respaldo si faltara el recurso: el icono dibujado de antes.
+    static Icon MakeTrayIcon()
     {
         using (var bmp = new Bitmap(32, 32))
         using (var g = Graphics.FromImage(bmp))
