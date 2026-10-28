@@ -1348,22 +1348,20 @@ class RadialMenu : Form
             }));
             return;
         }
-        if (action.Slow && ActionFinished != null)
-            ActionFinished(action.Description + "…", "Te aviso cuando termine. El progreso se ve en el icono de la bandeja.", false);
-        // El logo girando donde estaba el anillo hasta que el archivo está creado.
+        // El logo girando donde estaba el anillo hasta que el archivo está creado (con un ✓ al terminar): no hace
+        // falta ningún aviso si todo va bien; solo se avisa de los errores.
         var spinner = new Spinner(new Point(Left + center, Top + center));
         spinner.Start();
         Activity.Begin();
         Task.Factory.StartNew(() =>
         {
-            var outputs = new List<string>();
             var errors = new List<string>();
             foreach (var input in action.Batch ? new List<string> { null } : targets)
             {
                 try
                 {
-                    if (action.Batch) outputs.Add(action.RunBatch(targets));
-                    else outputs.Add(action.Run(input));
+                    if (action.Batch) action.RunBatch(targets);
+                    else action.Run(input);
                 }
                 catch (Exception ex)
                 {
@@ -1377,12 +1375,8 @@ class RadialMenu : Form
             {
                 spinner.Finish(errors.Count == 0);
                 Activity.End();
-                if (ActionFinished == null) return;
-                if (errors.Count > 0)
+                if (ActionFinished != null && errors.Count > 0)
                     ActionFinished("Switchify – error", string.Join("\n", errors.Take(3)), true);
-                else
-                    ActionFinished(action.Description + " ✓",
-                        outputs.Count == 1 ? Path.GetFileName(outputs[0]) : outputs.Count + " archivos creados", false);
             }));
         });
     }
@@ -1856,7 +1850,6 @@ class FileAction
     public Action<List<string>> OpenBatch;         // igual, pero con todos los archivos a la vez (imprimir)
     public List<FileAction> SubActions;            // otra página del anillo
     public string Icon;                            // símbolo dibujado sobre la etiqueta (ver Icons)
-    public bool Slow;                              // tarda (vídeo, audio): se avisa al empezar
     public bool Batch { get { return RunBatch != null; } }
 }
 
@@ -1954,7 +1947,7 @@ static class FileActions
     // Las conversiones de vídeo y audio pueden tardar: se marcan como lentas para avisar al empezar.
     static FileAction Media(string label, string description, string ext, bool compress)
     {
-        return new FileAction { Label = label, Description = description, Slow = true, Run = f => MediaOps.Convert(f, ext, compress) };
+        return new FileAction { Label = label, Description = description, Run = f => MediaOps.Convert(f, ext, compress) };
     }
 
     static readonly string[][] DocFormats =
@@ -2032,9 +2025,9 @@ static class FileActions
         {
             list.Add(new FileAction { Label = "PNG", Description = "Páginas a PNG", Run = f => Pdf.ToImages(f, ".png") });
             list.Add(new FileAction { Label = "JPG", Description = "Páginas a JPG", Run = f => Pdf.ToImages(f, ".jpg") });
-            list.Add(new FileAction { Label = "DOCX", Description = "Texto a Word (OCR)", Run = f => Documents.FromPdf(f, ".docx") });
-            list.Add(new FileAction { Label = "TXT", Description = "Extraer texto (OCR)", Run = f => Documents.FromPdf(f, ".txt") });
-            list.Add(new FileAction { Label = "MD", Description = "Texto a Markdown (OCR)", Run = f => Documents.FromPdf(f, ".md") });
+            list.Add(new FileAction { Label = "DOCX", Description = "PDF a Word", Run = f => Documents.FromPdf(f, ".docx") });
+            list.Add(new FileAction { Label = "TXT", Description = "PDF a texto", Run = f => Documents.FromPdf(f, ".txt") });
+            list.Add(new FileAction { Label = "MD", Description = "PDF a Markdown", Run = f => Documents.FromPdf(f, ".md") });
         }
         else if (files.All(f => File.Exists(f) && Documents.Extensions.Contains(Path.GetExtension(f).ToLowerInvariant())))
         {

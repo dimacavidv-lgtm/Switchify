@@ -33,7 +33,7 @@ It works in File Explorer and on the Desktop. If the file under the cursor is pa
 | Files | Options |
 |---|---|
 | **Images** (PNG, JPG, BMP, GIF, TIFF, ICO) | Convert between formats, to PDF (several images → one PDF) and to text with OCR. **Tools**: compress, crop, background, adjust, annotate, redact and view/remove metadata. |
-| **Documents** (MD, TXT, DOCX, HTML, PDF) | Convert between PDF, DOCX, MD, HTML and TXT. PDF to images (one per page) or to text with OCR. |
+| **Documents** (MD, TXT, DOCX, HTML, PDF) | Convert between PDF, DOCX, MD, HTML and TXT. PDF to Word, Markdown or text keeping headings, lists, tables, bold and italics (scanned PDFs go through OCR), or to images (one per page). Plain text is read with its structure too: headings, lists and tables. |
 | **Video** (MP4, MOV, MKV, AVI, WMV, WebM, 3GP) | Convert to MP4 or WMV, compress, and extract the audio to MP3, M4A or WAV. |
 | **Audio** (MP3, WAV, M4A, AAC, FLAC, WMA) | Convert between MP3, M4A, WAV, FLAC and WMA. |
 | **Anything** | Compress to ZIP (or extract a ZIP). Images and documents can also be printed. |

@@ -31,7 +31,7 @@ Funciona en el Explorador de archivos y en el Escritorio. Si el archivo bajo el 
 | Archivos | Opciones |
 |---|---|
 | **Imágenes** (PNG, JPG, BMP, GIF, TIFF, ICO) | Convertir entre formatos, a PDF (varias imágenes → un PDF) y a texto con OCR. **Herramientas**: comprimir, recortar, fondo, editar, anotar, tapar y ver o quitar metadatos. |
-| **Documentos** (MD, TXT, DOCX, HTML, PDF) | Convertir entre PDF, DOCX, MD, HTML y TXT. PDF a imágenes (una por página) o a texto con OCR. |
+| **Documentos** (MD, TXT, DOCX, HTML, PDF) | Convertir entre PDF, DOCX, MD, HTML y TXT. PDF a Word, Markdown o texto conservando títulos, listas, tablas, negritas y cursivas (los PDF escaneados pasan por OCR), o a imágenes (una por página). El texto plano también se lee con su estructura: títulos, listas y tablas. |
 | **Vídeo** (MP4, MOV, MKV, AVI, WMV, WebM, 3GP) | Convertir a MP4 o WMV, comprimir y extraer el audio a MP3, M4A o WAV. |
 | **Audio** (MP3, WAV, M4A, AAC, FLAC, WMA) | Convertir entre MP3, M4A, WAV, FLAC y WMA. |
 | **Cualquier archivo** | Comprimir en ZIP (o extraer un ZIP). Las imágenes y los documentos también se pueden imprimir. |

@@ -1125,7 +1125,6 @@ abstract class EditorForm : Form
         {
             string output = Paths.Beside(SourcePath, " " + suffix, ext);
             ImageOps.SaveAs(result, output, ext);
-            if (Notify != null) Notify("Guardado ✓", Path.GetFileName(output), false);
             Close();
         }
         catch (Exception ex)

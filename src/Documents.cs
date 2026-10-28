@@ -1,7 +1,8 @@
 // Conversión de documentos sin dependencias externas:
 //  - Markdown, TXT y DOCX se leen a un modelo común (lista de bloques) y se escriben en MD, TXT, HTML, DOCX o PDF.
 //  - El PDF se genera imprimiendo HTML con Microsoft Edge en modo headless (viene con Windows).
-//  - Los PDF se leen con Windows.Data.Pdf y el texto se extrae con el OCR de Windows (Windows.Media.Ocr).
+//  - El texto de los PDF se lee del propio archivo (PdfText) y su maquetación se convierte en títulos, listas y
+//    tablas (Layout). Los PDF escaneados pasan por el OCR de Windows (Windows.Media.Ocr), con la misma maquetación.
 
 using System;
 using System.Collections.Generic;
@@ -86,20 +87,34 @@ static class Documents
         return output;
     }
 
-    // Extrae el texto de un PDF con OCR y lo guarda como `target`.
+    // Extrae el contenido de un PDF (con su estructura) y lo guarda como `target`.
     public static string FromPdf(string input, string target)
     {
-        var blocks = PlainText.ToBlocks(Pdf.ExtractText(input));
+        var blocks = PdfBlocks(input);
         string output = Paths.Beside(input, "", target);
         Write(blocks, output, target, Path.GetFileNameWithoutExtension(input), Path.GetDirectoryName(input));
         return output;
     }
 
-    // Extrae el texto de una imagen con OCR a un .txt.
+    // Del texto que lleva el PDF; si no lleva (escaneado) o no se puede leer, con OCR.
+    public static List<Block> PdfBlocks(string input)
+    {
+        List<Block> blocks = null;
+        try
+        {
+            var pages = PdfText.Read(input);
+            if (pages != null) blocks = Layout.ToBlocks(Layout.FromPdf(pages));
+        }
+        catch { blocks = null; }
+        if (blocks == null || blocks.Count == 0) blocks = Layout.ToBlocks(Pdf.OcrPages(input));
+        return blocks;
+    }
+
+    // Extrae el texto de una imagen con OCR a un .txt (con títulos, listas y tablas si los hay).
     public static string ImageToText(string input)
     {
         string output = Paths.Beside(input, "", ".txt");
-        File.WriteAllText(output, Ocr.FromImageFile(input), new UTF8Encoding(false));
+        File.WriteAllText(output, TextWriterPlain.Write(Layout.ToBlocks(new List<LayoutPage> { Ocr.PageFromImageFile(input) })), new UTF8Encoding(false));
         return output;
     }
 
@@ -116,11 +131,21 @@ static class Documents
         switch (Path.GetExtension(path).ToLowerInvariant())
         {
             case ".md":
-            case ".markdown": return MarkdownReader.Parse(File.ReadAllText(path));
-            case ".txt": return PlainText.ToBlocks(File.ReadAllText(path));
+            case ".markdown": return MarkdownReader.Parse(ReadText(path));
+            case ".txt": return PlainText.ToBlocks(ReadText(path));
             case ".docx": return DocxReader.Read(path);
             default: throw new NotSupportedException("No sé leer " + Path.GetExtension(path));
         }
+    }
+
+    // Texto en UTF-8 (con o sin BOM) o, si no lo es, en la codificación clásica de Windows (ANSI).
+    static string ReadText(string path)
+    {
+        var bytes = File.ReadAllBytes(path);
+        if (bytes.Length >= 2 && ((bytes[0] == 0xFF && bytes[1] == 0xFE) || (bytes[0] == 0xFE && bytes[1] == 0xFF)))
+            return new StreamReader(new MemoryStream(bytes), true).ReadToEnd();
+        try { return new UTF8Encoding(false, true).GetString(bytes).TrimStart('\uFEFF'); }
+        catch (DecoderFallbackException) { return Encoding.Default.GetString(bytes); }
     }
 
     static void Write(List<Block> blocks, string output, string target, string title, string baseDir)
@@ -299,15 +324,353 @@ static class MarkdownReader
     }
 }
 
+// Texto plano a bloques: se reconoce la estructura que la gente escribe en un .txt sin formato.
+//  - Títulos: subrayados con === o ---, con # delante, en MAYÚSCULAS, numerados ("2.1 Objetivos"), la primera
+//    línea si es corta, o una línea corta sin punto final seguida de texto.
+//  - Listas: -, *, •, 1., 1), a) (el nivel sale de la sangría); las líneas sangradas que siguen son del mismo punto.
+//  - Tablas: columnas separadas por tabuladores, por |, por ; o , de forma regular, o alineadas con espacios.
+//  - Párrafos: las líneas cortadas por el ancho se unen; citas con >, separadores (---, ***) y código sangrado.
 static class PlainText
 {
-    // Texto plano: cada línea con contenido es un párrafo.
+    static readonly Regex UnderlineRx = new Regex(@"^\s*(=+|-+)\s*$");
+    static readonly Regex RuleRx = new Regex(@"^\s*([-_*=~·•])(\s*\1){2,}\s*$");
+    static readonly Regex HashRx = new Regex(@"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$");
+    static readonly Regex BulletRx = new Regex(@"^(\s*)([-*+•·▪◦‣○●■□►▸➢➤–—])\s+(.*)$");
+    static readonly Regex NumberedRx = new Regex(@"^(\s*)(\(?(?:\d{1,3}|[a-zA-Z])[.)])\s+(.*)$");
+    static readonly Regex SectionRx = new Regex(@"^(\d{1,2}(\.\d{1,2}){0,3})\.?\s+\S");
+    static readonly Regex TableSepRx = new Regex(@"^\s*[|+]?\s*:?[-=]{2,}:?\s*([|+]\s*:?[-=]{2,}:?\s*)*[|+]?\s*$|^\s*-{2,}(\s{2,}-{2,})+\s*$");
+
     public static List<Block> ToBlocks(string text)
     {
-        return text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n')
-            .Where(l => l.Trim().Length > 0)
-            .Select(l => Block.Text(BlockKind.Paragraph, l.TrimEnd()))
-            .ToList();
+        var lines = text.Replace("\r\n", "\n").Replace('\r', '\n').Replace("\t", "\t").Split('\n').Select(l => l.TrimEnd()).ToList();
+        // Ancho al que está cortado el texto (si lo está): casi todas las líneas largas llegan hasta ahí.
+        var lengths = lines.Where(l => l.Trim().Length > 0).Select(l => l.Length).OrderBy(x => x).ToList();
+        int wrap = lengths.Count == 0 ? 80 : lengths[(int)(lengths.Count * 0.9)];
+        // ¿Está cortado a un ancho fijo (líneas que llegan casi siempre al mismo largo), o cada línea es un párrafo?
+        bool wrapped = wrap >= 40 && wrap <= 110 && lengths.Count(l => l >= wrap * 0.8) >= 3;
+
+        var blocks = new List<Block>();
+        var para = new List<string>();
+        Block item = null;
+        int itemIndent = 0, listIndent = 0;
+        bool first = true;
+
+        Action flush = () =>
+        {
+            if (para.Count == 0) return;
+            blocks.Add(Paragraph(para));
+            para.Clear();
+        };
+
+        for (int i = 0; i < lines.Count; i++)
+        {
+            string line = lines[i];
+            string t = line.Trim();
+            Match m;
+
+            if (t.Length == 0) { flush(); item = null; continue; }
+            string next = i + 1 < lines.Count ? lines[i + 1] : "";
+
+            // Título subrayado (Setext).
+            if (!UnderlineRx.IsMatch(line) && UnderlineRx.IsMatch(next) && next.Trim().Length >= Math.Min(3, t.Length) && !IsTableRow(line))
+            {
+                flush(); item = null;
+                blocks.Add(Heading(next.Trim()[0] == '=' ? 1 : 2, t));
+                i++; first = false;
+                continue;
+            }
+            if ((m = HashRx.Match(line)).Success)
+            {
+                flush(); item = null;
+                blocks.Add(Heading(m.Groups[1].Length, m.Groups[2].Value));
+                first = false;
+                continue;
+            }
+            if (RuleRx.IsMatch(line))
+            {
+                flush(); item = null;
+                blocks.Add(new Block { Kind = BlockKind.Rule });
+                continue;
+            }
+
+            // Tabla: dos o más líneas seguidas con las mismas columnas.
+            int end;
+            var table = TableAt(lines, i, out end);
+            if (table != null)
+            {
+                flush(); item = null;
+                blocks.Add(table);
+                i = end - 1; first = false;
+                continue;
+            }
+
+            // Cita.
+            if (t.StartsWith(">"))
+            {
+                flush(); item = null;
+                var quote = new List<string>();
+                for (; i < lines.Count && lines[i].Trim().StartsWith(">"); i++) quote.Add(lines[i].Trim().Substring(1).Trim());
+                i--;
+                var q = Paragraph(quote);
+                q.Kind = BlockKind.Quote;
+                blocks.Add(q);
+                continue;
+            }
+
+            // Lista.
+            bool bullet = (m = BulletRx.Match(line)).Success;
+            if (bullet || (m = NumberedRx.Match(line)).Success)
+            {
+                // "1. Introducción" sola y sin punto final, entre párrafos, es un apartado, no una lista.
+                if (!bullet && LooksLikeHeading(lines, i, wrapped) && SectionRx.IsMatch(t)) { }
+                else
+                {
+                    flush();
+                    int indent = Indent(m.Groups[1].Value);
+                    // El nivel cuenta desde la sangría del primer punto de la lista.
+                    if (item == null) listIndent = indent;
+                    item = new Block { Kind = bullet ? BlockKind.Bullet : BlockKind.Numbered, Level = Math.Max(0, Math.Min(4, (indent - listIndent + 1) / 2)) };
+                    MarkdownReader.ParseInline(m.Groups[3].Value, item.Inlines);
+                    itemIndent = indent + m.Groups[2].Value.Length + 1;
+                    blocks.Add(item);
+                    first = false;
+                    continue;
+                }
+            }
+            // Continuación de un punto de la lista: sangrada al menos como su texto, o cortada por el ancho.
+            if (item != null && (Indent(line) >= itemIndent - 1 || Indent(line) > 0))
+            {
+                item.Inlines.Add(new Inline { Text = " " });
+                MarkdownReader.ParseInline(t, item.Inlines);
+                continue;
+            }
+            item = null;
+
+            // Código: bloque de líneas sangradas 4 espacios (o tabulador) que no siguen a un párrafo.
+            if (para.Count == 0 && (line.StartsWith("    ") || line.StartsWith("\t")))
+            {
+                var code = new List<string>();
+                for (; i < lines.Count && (lines[i].StartsWith("    ") || lines[i].StartsWith("\t") || (lines[i].Trim().Length == 0 && i + 1 < lines.Count && (lines[i + 1].StartsWith("    ") || lines[i + 1].StartsWith("\t")))); i++)
+                    code.Add(lines[i].StartsWith("\t") ? lines[i].Substring(1) : lines[i].Length >= 4 ? lines[i].Substring(4) : "");
+                i--;
+                blocks.Add(new Block { Kind = BlockKind.Code, CodeText = string.Join("\n", code) });
+                first = false;
+                continue;
+            }
+
+            // Títulos sin marcas.
+            if (!wrapped) flush();
+            if (para.Count == 0 && LooksLikeHeading(lines, i, wrapped))
+            {
+                int level;
+                var sec = SectionRx.Match(t);
+                if (first) level = 1;
+                else if (sec.Success) level = Math.Min(4, sec.Groups[1].Value.Split('.').Length + 1);
+                else level = 2;
+                blocks.Add(Heading(level, t));
+                first = false;
+                continue;
+            }
+            first = false;
+
+            // Párrafo: una línea se une a la siguiente si estaba cortada por el ancho (llega cerca del final).
+            if (para.Count > 0)
+            {
+                string prev = para[para.Count - 1];
+                if (!wrapped || prev.Length < wrap * 0.6) flush();
+            }
+            para.Add(t);
+        }
+        flush();
+        return blocks;
+    }
+
+    static int Indent(string s)
+    {
+        int n = 0;
+        foreach (char c in s) { if (c == ' ') n++; else if (c == '\t') n += 4; else break; }
+        return n;
+    }
+
+    static Block Heading(int level, string text)
+    {
+        var b = new Block { Kind = BlockKind.Heading, Level = Math.Max(1, Math.Min(6, level)) };
+        MarkdownReader.ParseInline(text.Trim().TrimEnd(':').Trim(), b.Inlines);
+        return b;
+    }
+
+    static Block Paragraph(List<string> lines)
+    {
+        var b = new Block { Kind = BlockKind.Paragraph };
+        var sb = new StringBuilder();
+        foreach (var l in lines)
+        {
+            if (sb.Length > 0)
+            {
+                // Palabra partida con guion al final de línea.
+                if (sb[sb.Length - 1] == '-' && sb.Length > 1 && char.IsLetter(sb[sb.Length - 2]) && l.Length > 0 && char.IsLower(l[0])) sb.Length--;
+                else sb.Append(' ');
+            }
+            sb.Append(l.Trim());
+        }
+        MarkdownReader.ParseInline(sb.ToString(), b.Inlines);
+        return b;
+    }
+
+    // Línea corta, sin punto final, que empieza en mayúscula o número, y tras ella hay texto (o un blanco).
+    // `wrapped`: el texto está cortado a un ancho fijo; si no, cada línea es un párrafo y un título no necesita
+    // una línea en blanco encima.
+    static bool LooksLikeHeading(List<string> lines, int i, bool wrapped)
+    {
+        string t = lines[i].Trim();
+        if (t.Length < 2 || t.Length > 70 || !t.Any(char.IsLetter)) return false;
+        if (".,;!?".Contains(t[t.Length - 1])) return false;
+        if (!(char.IsUpper(t[0]) || char.IsDigit(t[0]) || "¿¡\"'«".Contains(t[0]))) return false;
+        if (t.Split(' ').Length > 10) return false;
+        // "Fecha: 14 de octubre" es un dato, no un título.
+        int colon = t.IndexOf(':');
+        bool firstLine = !lines.Take(i).Any(l => l.Trim().Length > 0);
+        if (colon > 0 && colon < t.Length - 1 && !SectionRx.IsMatch(t) && !firstLine) return false;
+        string prev = i > 0 ? lines[i - 1].Trim() : "";
+        string next = i + 1 < lines.Count ? lines[i + 1].Trim() : "";
+        // Un título siempre tiene algo debajo (una línea suelta al final, como una firma, no lo es).
+        if (!lines.Skip(i + 1).Any(l => l.Trim().Length > 0)) return false;
+        bool caps = t.Any(char.IsLetter) && t.Where(char.IsLetter).All(char.IsUpper) && t.Count(char.IsLetter) >= 3;
+        bool section = SectionRx.IsMatch(t);
+        // Separado por líneas en blanco, o seguido de un texto más largo.
+        bool standsAlone = (prev.Length == 0 || !wrapped) && (next.Length == 0 || next.Length > t.Length * 1.3 || BulletRx.IsMatch(lines[i + 1]) || NumberedRx.IsMatch(lines[i + 1]));
+        if (t.EndsWith(":")) return (caps || section) && standsAlone;
+        return standsAlone && (caps || section || firstLine || next.Length == 0 || next.Length > t.Length * 1.3);
+    }
+
+    // --- Tablas -------------------------------------------------------------------------------
+
+    static bool IsTableRow(string line) { return line.Contains('\t') || line.Count(c => c == '|') >= 2; }
+
+    static Block TableAt(List<string> lines, int start, out int end)
+    {
+        end = start;
+        foreach (var split in new Func<string, List<string>>[] { SplitTabs, SplitPipes, SplitSemicolons, SplitCommas })
+        {
+            var rows = new List<List<string>>();
+            int j = start;
+            int cols = -1;
+            for (; j < lines.Count; j++)
+            {
+                string l = lines[j];
+                if (l.Trim().Length == 0) break;
+                if (TableSepRx.IsMatch(l) && rows.Count > 0) continue;
+                var cells = split(l);
+                if (cells == null || cells.Count < 2) break;
+                if (cols < 0) cols = cells.Count;
+                // Con separadores de verdad se exige el mismo número de columnas (con comas y punto y coma, más aún).
+                if (cells.Count != cols && (split == SplitCommas || split == SplitSemicolons || Math.Abs(cells.Count - cols) > 1)) break;
+                rows.Add(cells);
+            }
+            if (rows.Count >= 2 && (split != SplitCommas || (rows.Count >= 3 && cols >= 3)))
+            {
+                end = j;
+                return TableBlock(rows);
+            }
+        }
+
+        // Columnas alineadas con dos o más espacios.
+        var spaced = SpacedTable(lines, start, out end);
+        return spaced;
+    }
+
+    static List<string> SplitTabs(string l) { return l.Contains('\t') ? l.Split('\t').Select(c => c.Trim()).Where((c, k) => true).ToList() : null; }
+
+    static List<string> SplitPipes(string l)
+    {
+        string t = l.Trim();
+        if (t.Count(c => c == '|') < 1 || (!t.StartsWith("|") && t.Count(c => c == '|') < 2 && !t.Contains(" | "))) return null;
+        if (t.StartsWith("|")) t = t.Substring(1);
+        if (t.EndsWith("|")) t = t.Substring(0, t.Length - 1);
+        return t.Split('|').Select(c => c.Trim()).ToList();
+    }
+
+    static List<string> SplitSemicolons(string l) { return l.Count(c => c == ';') >= 1 && !l.TrimEnd().EndsWith(";") ? l.Split(';').Select(c => c.Trim().Trim('"')).ToList() : null; }
+
+    // CSV: comas fuera de comillas, y celdas cortas (para no confundirlo con frases con comas).
+    static List<string> SplitCommas(string l)
+    {
+        if (!l.Contains(',')) return null;
+        var cells = new List<string>();
+        var sb = new StringBuilder();
+        bool quoted = false;
+        foreach (char c in l)
+        {
+            if (c == '"') { quoted = !quoted; continue; }
+            if (c == ',' && !quoted) { cells.Add(sb.ToString().Trim()); sb.Clear(); continue; }
+            sb.Append(c);
+        }
+        cells.Add(sb.ToString().Trim());
+        if (cells.Any(c => c.Split(' ').Length > 6)) return null;
+        return cells;
+    }
+
+    // Tabla "de máquina de escribir": columnas que empiezan en las mismas posiciones, separadas por 2+ espacios.
+    static Block SpacedTable(List<string> lines, int start, out int end)
+    {
+        end = start;
+        var rows = new List<string>();
+        int j = start;
+        for (; j < lines.Count; j++)
+        {
+            string l = lines[j];
+            if (l.Trim().Length == 0) break;
+            if (TableSepRx.IsMatch(l) && rows.Count > 0) { rows.Add(null); continue; }
+            if (!Regex.IsMatch(l.Trim(), @"\S\s{2,}\S")) break;
+            if (BulletRx.IsMatch(l) || NumberedRx.IsMatch(l)) break;
+            rows.Add(l);
+        }
+        var real = rows.Where(r => r != null).ToList();
+        if (real.Count < 2) return null;
+
+        // Columnas: posiciones donde, en todas las filas, hay un hueco de 2+ espacios (o el final de la línea).
+        int width = real.Max(r => r.Length);
+        var blank = new bool[width + 2];
+        for (int x = 0; x < blank.Length; x++) blank[x] = real.All(r => x >= r.Length || r[x] == ' ');
+        var starts = new List<int>();
+        for (int x = 0; x < width; x++)
+            if (!blank[x] && (x == 0 || (blank[x - 1] && (x < 2 || blank[x - 2]))))
+                starts.Add(x);
+        if (starts.Count < 2) return null;
+
+        var table = new List<List<string>>();
+        foreach (var r in real)
+        {
+            var cells = new List<string>();
+            for (int k = 0; k < starts.Count; k++)
+            {
+                int a = starts[k], b = k + 1 < starts.Count ? starts[k + 1] : int.MaxValue;
+                cells.Add(a >= r.Length ? "" : r.Substring(a, Math.Min(r.Length, b) - a).Trim());
+            }
+            table.Add(cells);
+        }
+        // Debe parecer una tabla: la mayoría de filas con varias celdas llenas.
+        if (table.Count(c => c.Count(x => x.Length > 0) >= 2) < Math.Max(2, table.Count * 0.6)) return null;
+        end = j;
+        return TableBlock(table);
+    }
+
+    static Block TableBlock(List<List<string>> rows)
+    {
+        int cols = rows.Max(r => r.Count);
+        var b = new Block { Kind = BlockKind.Table, Rows = new List<List<List<Inline>>>() };
+        foreach (var r in rows)
+        {
+            var row = new List<List<Inline>>();
+            for (int c = 0; c < cols; c++)
+            {
+                var inl = new List<Inline>();
+                MarkdownReader.ParseInline(c < r.Count ? r[c] : "", inl);
+                row.Add(inl);
+            }
+            b.Rows.Add(row);
+        }
+        return b;
     }
 }
 
@@ -509,18 +872,29 @@ static class MarkdownWriter
     {
         var sb = new StringBuilder();
         BlockKind? prev = null;
+        var counters = new int[8];
         foreach (var b in blocks)
         {
             bool listItem = b.Kind == BlockKind.Bullet || b.Kind == BlockKind.Numbered;
             bool prevList = prev == BlockKind.Bullet || prev == BlockKind.Numbered;
-            if (sb.Length > 0 && !(listItem && prevList)) sb.Append('\n');
+            // Entre puntos de lista no va línea en blanco, salvo si cambia el tipo de lista (viñetas / números).
+            bool sameList = listItem && prevList && (b.Level > 0 || b.Kind == prev);
+            if (sb.Length > 0 && !sameList) sb.Append('\n');
+            if (!listItem) Array.Clear(counters, 0, counters.Length);
+            int number = 1;
+            if (b.Kind == BlockKind.Numbered)
+            {
+                int lvl = Math.Min(7, b.Level);
+                number = ++counters[lvl];
+                for (int k = lvl + 1; k < counters.Length; k++) counters[k] = 0;
+            }
 
             switch (b.Kind)
             {
                 case BlockKind.Heading: sb.Append(new string('#', b.Level)).Append(' ').Append(Inlines(b.Inlines)).Append('\n'); break;
                 case BlockKind.Paragraph: sb.Append(Inlines(b.Inlines)).Append('\n'); break;
                 case BlockKind.Bullet: sb.Append(new string(' ', b.Level * 2)).Append("- ").Append(Inlines(b.Inlines)).Append('\n'); break;
-                case BlockKind.Numbered: sb.Append(new string(' ', b.Level * 3)).Append("1. ").Append(Inlines(b.Inlines)).Append('\n'); break;
+                case BlockKind.Numbered: sb.Append(new string(' ', b.Level * 3)).Append(number).Append(". ").Append(Inlines(b.Inlines)).Append('\n'); break;
                 case BlockKind.Quote: sb.Append("> ").Append(Inlines(b.Inlines)).Append('\n'); break;
                 case BlockKind.Code: sb.Append("```\n").Append(b.CodeText).Append("\n```\n"); break;
                 case BlockKind.Rule: sb.Append("---\n"); break;
@@ -563,34 +937,60 @@ static class MarkdownWriter
 
 static class TextWriterPlain
 {
+    // Texto plano que se lee bien y conserva la estructura: títulos subrayados, listas con viñeta y tablas en
+    // columnas alineadas (al volver a leerlo como TXT se reconocen).
     public static string Write(List<Block> blocks)
     {
         var sb = new StringBuilder();
-        int counter = 0;
+        var counters = new int[8];
         bool inList = false;
         foreach (var b in blocks)
         {
-            counter = b.Kind == BlockKind.Numbered ? counter + 1 : 0;
             bool listItem = b.Kind == BlockKind.Bullet || b.Kind == BlockKind.Numbered;
             if (inList && !listItem) sb.Append('\n');
+            if (!listItem) Array.Clear(counters, 0, counters.Length);
             inList = listItem;
-            string indent = new string(' ', b.Level * 2);
+            string indent = new string(' ', b.Level * 3);
             switch (b.Kind)
             {
-                case BlockKind.Heading: sb.Append(Text(b.Inlines).ToUpper(CultureInfo.CurrentCulture)).Append("\n\n"); break;
-                case BlockKind.Bullet: sb.Append(indent).Append("• ").Append(Text(b.Inlines)).Append('\n'); break;
-                case BlockKind.Numbered: sb.Append(indent).Append(counter).Append(". ").Append(Text(b.Inlines)).Append('\n'); break;
-                case BlockKind.Code: sb.Append(b.CodeText).Append("\n\n"); break;
-                case BlockKind.Rule: sb.Append("----------\n\n"); break;
-                case BlockKind.Table:
-                    foreach (var row in b.Rows) sb.Append(string.Join("\t", row.Select(Text))).Append('\n');
-                    sb.Append('\n');
+                case BlockKind.Heading:
+                    string h = Text(b.Inlines).Trim();
+                    sb.Append(h).Append('\n').Append(new string(b.Level <= 1 ? '=' : '-', Math.Max(3, Width(h)))).Append("\n\n");
                     break;
+                case BlockKind.Bullet:
+                    sb.Append(indent).Append("• ").Append(Text(b.Inlines)).Append('\n');
+                    break;
+                case BlockKind.Numbered:
+                    int lvl = Math.Min(7, b.Level);
+                    counters[lvl]++;
+                    for (int k = lvl + 1; k < counters.Length; k++) counters[k] = 0;
+                    sb.Append(indent).Append(counters[lvl]).Append(". ").Append(Text(b.Inlines)).Append('\n');
+                    break;
+                case BlockKind.Quote: sb.Append("> ").Append(Text(b.Inlines)).Append("\n\n"); break;
+                case BlockKind.Code: sb.Append(string.Join("\n", b.CodeText.Split('\n').Select(l => "    " + l))).Append("\n\n"); break;
+                case BlockKind.Rule: sb.Append("----------\n\n"); break;
+                case BlockKind.Table: AppendTable(sb, b.Rows); sb.Append('\n'); break;
                 default: sb.Append(Text(b.Inlines)).Append("\n\n"); break;
             }
         }
         return sb.ToString().TrimEnd() + "\n";
     }
+
+    // Columnas alineadas con espacios y una raya bajo la cabecera.
+    static void AppendTable(StringBuilder sb, List<List<List<Inline>>> rows)
+    {
+        int cols = rows.Max(r => r.Count);
+        var text = rows.Select(r => Enumerable.Range(0, cols).Select(c => c < r.Count ? Text(r[c]).Replace("\n", " ").Trim() : "").ToList()).ToList();
+        var widths = Enumerable.Range(0, cols).Select(c => Math.Max(3, text.Max(r => Width(r[c])))).ToList();
+        for (int i = 0; i < text.Count; i++)
+        {
+            sb.Append(string.Join("   ", Enumerable.Range(0, cols).Select(c => Pad(text[i][c], widths[c]))).TrimEnd()).Append('\n');
+            if (i == 0) sb.Append(string.Join("   ", widths.Select(w => new string('-', w)))).Append('\n');
+        }
+    }
+
+    static int Width(string s) { return s.Length; }
+    static string Pad(string s, int w) { return s + new string(' ', Math.Max(0, w - Width(s))); }
 
     public static string Text(List<Inline> inlines)
     {
@@ -970,17 +1370,18 @@ static class Pdf
         return first;
     }
 
-    public static string ExtractText(string input)
+    // OCR de cada página, con la posición de cada palabra.
+    public static List<LayoutPage> OcrPages(string input)
     {
         var doc = Open(input);
         var engine = Ocr.Engine();
-        var sb = new StringBuilder();
+        var pages = new List<LayoutPage>();
         for (uint i = 0; i < doc.PageCount; i++)
         {
             using (var stream = Render(doc, i, RenderScale))
-                sb.Append(Ocr.Recognize(engine, stream)).Append('\n');
+                pages.Add(Ocr.RecognizePage(engine, stream, (int)i));
         }
-        return sb.ToString();
+        return pages;
     }
 }
 
@@ -1051,6 +1452,28 @@ static class Ocr
     {
         using (var stream = WinRt.ToStream(File.ReadAllBytes(path)))
             return Recognize(Engine(), stream);
+    }
+
+    public static LayoutPage PageFromImageFile(string path)
+    {
+        using (var stream = WinRt.ToStream(File.ReadAllBytes(path)))
+            return RecognizePage(Engine(), stream, 0);
+    }
+
+    // Las líneas del OCR con la caja de cada palabra, para reconstruir la maquetación.
+    public static LayoutPage RecognizePage(OcrEngine engine, IRandomAccessStream stream, int index)
+    {
+        var decoder = WinRt.Wait(BitmapDecoder.CreateAsync(stream));
+        using (var raw = WinRt.Wait(decoder.GetSoftwareBitmapAsync()))
+        using (var bitmap = SoftwareBitmap.Convert(raw, BitmapPixelFormat.Bgra8, BitmapAlphaMode.Premultiplied))
+        {
+            var result = WinRt.Wait(engine.RecognizeAsync(bitmap));
+            var lines = result.Lines.Select(l => l.Words.Select(w => new Layout.OcrWordBox
+            {
+                Text = w.Text, X = w.BoundingRect.X, Y = w.BoundingRect.Y, W = w.BoundingRect.Width, H = w.BoundingRect.Height
+            }).ToList()).ToList();
+            return Layout.FromOcr(lines, bitmap.PixelWidth, bitmap.PixelHeight, index);
+        }
     }
 
     // Reconoce el texto y reconstruye párrafos: una línea que termina en punto o es corta cierra el párrafo.
