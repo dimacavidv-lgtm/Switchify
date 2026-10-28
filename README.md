@@ -72,3 +72,11 @@ Uncheck **Iniciar con Windows**, choose **Salir** (Exit) from the tray menu, and
 ## Limitations
 
 To stay free of external dependencies, Switchify cannot convert **to** WebM, MKV, GIF (video) or OGG, nor read OGG/Opus files.
+
+## Contributing
+
+Suggestions and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+[MIT](LICENSE) © dimacavidv-lgtm

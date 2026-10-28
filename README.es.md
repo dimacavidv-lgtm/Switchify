@@ -70,3 +70,11 @@ Desmarca **Iniciar con Windows**, elige **Salir** en el menú de la bandeja y bo
 ## Limitaciones
 
 Para no depender de programas externos, Switchify no puede convertir **a** WebM, MKV, GIF (vídeo) ni OGG, ni leer archivos OGG/Opus.
+
+## Contribuir
+
+Las sugerencias y los pull requests son bienvenidos. Mira [CONTRIBUTING.md](CONTRIBUTING.md) (en inglés).
+
+## Licencia
+
+[MIT](LICENSE) © dimacavidv-lgtm
